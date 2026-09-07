@@ -1,0 +1,9 @@
+# Contains account tokens, Octagon private keys, PCS private identities, and
+# private Safari history/bookmark/tab data. Never commit this directory.
+/fixtures/private/
+
+# Rust build output.
+/target/
+
+# Fallback state directory when a platform state location is unavailable.
+/.icloud-safari/

@@ -1,0 +1,60 @@
+[package]
+name = "icloud-safari"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Rust client for Safari data stored in iCloud"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["experimental-live-writes"]
+experimental-live-writes = []
+
+[lib]
+name = "icloud_safari"
+
+[[bin]]
+name = "icloud-safari"
+path = "src/bin/icloud-safari.rs"
+
+[dependencies]
+aes = "0.8"
+aes-gcm = "0.10"
+aes-siv = "0.7"
+async-trait = "0.1"
+base64 = "0.22"
+cbc = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+cipher = "0.4"
+directories = "6"
+flate2 = "1"
+hex = "0.4"
+hkdf = "0.12"
+hmac = "0.12"
+num-bigint = "0.4"
+num-traits = "0.2"
+omnisette = { git = "https://github.com/SideStore/apple-private-apis", rev = "03beb1aa42991ccdad6214dee77e72282bef461f", features = ["async"] }
+p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8"] }
+p384 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8"] }
+pbkdf2 = "0.12"
+plist = "1.8"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["gzip", "json", "rustls-tls"] }
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+zeroize = { version = "1", features = ["derive"] }
+zip = { version = "6", default-features = false, features = ["deflate-flate2"] }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"

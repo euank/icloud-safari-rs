@@ -1,0 +1,14 @@
+[extend]
+useDefault = true
+
+# Exact public known-answer values, not a blanket exclusion of fixture files.
+[allowlist]
+description = "Synthetic/public cryptographic vectors and a JSON field name"
+regexTarget = "secret"
+regexes = [
+  '^aecd2bc801d745b357b6f7385bc1b069$',
+  '^000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f$',
+  '^e2c1dd095b2ae33d79579af07644296727b90d85828d2ea1632795e88ef2ce689383034797e27622241e568f40a3272f$',
+  '^175d179875780ee3270f6c0dce3e1151d4e25ce567fdc8ab2c2db264af8f91bc$',
+  '^encryption_priv_x963$',
+]
