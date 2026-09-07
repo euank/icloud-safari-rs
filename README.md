@@ -20,6 +20,28 @@ requested, its two-factor code.
 If the account's trusted Apple devices are unavailable, use `cargo run --
 login --sms` to request the code from its trusted phone instead.
 
+Run `cargo run -- status` to inspect local setup without contacting Apple.
+Re-running `login` defaults to the saved account and preserves its encryption
+enrollment and service identifiers. Failed authentication leaves the saved
+session intact. Use a separate `--state-dir PATH` for each Apple Account;
+login refuses to replace a saved session with a different account's DSID.
+
+Online commands refresh saved tokens before operating; `cargo run -- refresh`
+does so explicitly. There is no background refresh process after a command exits.
+
+### Encryption-key setup
+
+Login authenticates the account but does **not** yet enroll a new device in
+iCloud Keychain or recover Safari encryption keys. A fresh login therefore
+cannot by itself decrypt Safari data or passwords. The `escrow`, `octagon`,
+and `keys` commands remain unimplemented.
+
+Existing setups need their own `pcs-identities/*.der` files for Safari, and
+saved Octagon enrollment plus the keychain CloudKit user ID for passwords.
+Keep the original private state directory when reauthenticating. `status`
+reports whether these files/state are present; it does not validate the keys
+or promise that saved credentials are still accepted by Apple.
+
 The client includes Apple's [publicly distributed legacy Apple Root CA](https://www.apple.com/certificateauthority/) because
 the GrandSlam endpoint still serves that private-PKI chain. TLS verification is
 never disabled.

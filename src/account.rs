@@ -62,6 +62,21 @@ impl<T: HttpTransport, A: AnisetteProvider> AccountClient<T, A> {
         }
     }
 
+    /// Finish authentication without discarding existing encryption enrollment.
+    /// Account identity is checked using the server-returned DSID, not the
+    /// user-entered email address. Callers persist the result only on success.
+    pub async fn complete_login(
+        &self,
+        username: &str,
+        credentials: &GrandSlamCredentials,
+        previous: Option<&SessionState>,
+    ) -> Result<SessionState> {
+        let mut session = self.login_mobileme(username, credentials).await?;
+        preserve_account_state(&mut session, previous)?;
+        self.refresh_session(&mut session).await?;
+        Ok(session)
+    }
+
     pub async fn authenticate(
         &self,
         username: &str,
@@ -151,6 +166,11 @@ impl<T: HttpTransport, A: AnisetteProvider> AccountClient<T, A> {
         code: &str,
         credentials: &GrandSlamCredentials,
     ) -> Result<()> {
+        if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(Error::Authentication(
+                "verification code must contain exactly six digits".into(),
+            ));
+        }
         self.second_factor_request(factor, Some(code), credentials)
             .await
     }
@@ -427,6 +447,42 @@ impl<T: HttpTransport, A: AnisetteProvider> AccountClient<T, A> {
     }
 }
 
+fn preserve_account_state(
+    session: &mut SessionState,
+    previous: Option<&SessionState>,
+) -> Result<()> {
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    if session.dsid.is_empty()
+        || session.dsid != previous.dsid
+        || session.mme.dsid != previous.mme.dsid
+    {
+        return Err(Error::Authentication(
+            "this state directory belongs to a different Apple Account; use --state-dir with a separate directory".into(),
+        ));
+    }
+    // Fresh authentication owns the tokens. Preserve enrollment and cached
+    // service identifiers, but never resurrect expired tokens from the old login.
+    for (key, value) in &previous.extra {
+        session
+            .extra
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
+    }
+    for (key, value) in &previous.mme.extra {
+        if key != "accountSettings" {
+            session
+                .mme
+                .extra
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+    }
+    session.safari_cloudkit_users = previous.safari_cloudkit_users.clone();
+    Ok(())
+}
+
 fn dictionary<const N: usize>(entries: [(&str, Value); N]) -> Dictionary {
     entries
         .into_iter()
@@ -542,6 +598,170 @@ fn basic(user: &str, secret: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn saved_session() -> SessionState {
+        serde_json::from_value(serde_json::json!({
+            "username": "old@example.invalid", "dsid": "123",
+            "mme": {"dsid": "123", "mmeAuthToken": "old",
+                "tokens": {"expiredService": "old"}, "cloudKitUserId": "user-id",
+                "accountSettings": {"old": true}},
+            "safari_cloudkit_users": {"safari": "container-user"},
+            "octagon": {"peer_id": "test-peer"}
+        }))
+        .unwrap()
+    }
+
+    struct FakeAnisette;
+    #[async_trait::async_trait]
+    impl AnisetteProvider for FakeAnisette {
+        async fn headers(&self) -> Result<BTreeMap<String, String>> {
+            Ok(BTreeMap::from([
+                ("X-Apple-I-MD".into(), "test".into()),
+                ("X-Apple-I-MD-M".into(), "test".into()),
+            ]))
+        }
+    }
+
+    struct LoginTransport {
+        dsid: &'static str,
+        fail_refresh: bool,
+    }
+    #[async_trait::async_trait]
+    impl HttpTransport for LoginTransport {
+        async fn send(&self, request: HttpRequest) -> Result<crate::cloudkit::HttpResponse> {
+            let value = match request.url.as_str() {
+                LOGIN_DELEGATES_URL => Value::Dictionary(dictionary([
+                    ("dsid", Value::String(self.dsid.into())),
+                    (
+                        "delegates",
+                        Value::Dictionary(dictionary([(
+                            "com.apple.mobileme",
+                            Value::Dictionary(dictionary([
+                                ("status", Value::Integer(0.into())),
+                                (
+                                    "service-data",
+                                    Value::Dictionary(dictionary([(
+                                        "tokens",
+                                        Value::Dictionary(dictionary([
+                                            ("mmeAuthToken", Value::String("fresh".into())),
+                                            ("cloudKitToken", Value::String("fresh-cloud".into())),
+                                        ])),
+                                    )])),
+                                ),
+                            ])),
+                        )])),
+                    ),
+                ])),
+                ACCOUNT_SETTINGS_URL if self.fail_refresh => {
+                    return Err(Error::Network("test failure".into()));
+                }
+                ACCOUNT_SETTINGS_URL => Value::Dictionary(dictionary([
+                    ("status", Value::Integer(0.into())),
+                    (
+                        "tokens",
+                        Value::Dictionary(dictionary([(
+                            "mmeAuthToken",
+                            Value::String("refreshed".into()),
+                        )])),
+                    ),
+                ])),
+                _ => panic!("unexpected request"),
+            };
+            Ok(crate::cloudkit::HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: plist_bytes(value)?,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn relogin_preserves_enrollment_but_replaces_tokens() {
+        let account = AccountClient::new(
+            LoginTransport {
+                dsid: "123",
+                fail_refresh: false,
+            },
+            FakeAnisette,
+            DeviceState::generate(),
+        );
+        let previous = saved_session();
+        let credentials = GrandSlamCredentials {
+            adsid: "123".into(),
+            idms_token: String::new(),
+            pet: "test".into(),
+        };
+        let fresh = account
+            .complete_login("alias@example.invalid", &credentials, Some(&previous))
+            .await
+            .unwrap();
+        assert_eq!(fresh.extra["octagon"], previous.extra["octagon"]);
+        assert_eq!(fresh.mme.extra["cloudKitUserId"], "user-id");
+        assert_eq!(fresh.safari_cloudkit_users, previous.safari_cloudkit_users);
+        assert_eq!(fresh.mme.mme_auth_token, "refreshed");
+        assert_eq!(fresh.mme.tokens["cloudKitToken"], "fresh-cloud");
+        assert!(!fresh.mme.tokens.contains_key("expiredService"));
+        assert_ne!(
+            fresh.mme.extra["accountSettings"],
+            previous.mme.extra["accountSettings"]
+        );
+        assert_eq!(previous.mme.mme_auth_token, "old");
+        let fresh = account
+            .complete_login("new@example.invalid", &credentials, None)
+            .await
+            .unwrap();
+        assert!(!fresh.extra.contains_key("octagon"));
+    }
+
+    #[tokio::test]
+    async fn failed_or_cross_account_login_leaves_previous_state_unchanged() {
+        let previous = saved_session();
+        let before = serde_json::to_value(&previous).unwrap();
+        let credentials = GrandSlamCredentials {
+            adsid: "123".into(),
+            idms_token: String::new(),
+            pet: "test".into(),
+        };
+        for (dsid, fail_refresh) in [("456", false), ("123", true)] {
+            let account = AccountClient::new(
+                LoginTransport { dsid, fail_refresh },
+                FakeAnisette,
+                DeviceState::generate(),
+            );
+            assert!(
+                account
+                    .complete_login("old@example.invalid", &credentials, Some(&previous))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(serde_json::to_value(&previous).unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_code_is_rejected_before_any_request() {
+        let account = AccountClient::new(
+            LoginTransport {
+                dsid: "123",
+                fail_refresh: false,
+            },
+            FakeAnisette,
+            DeviceState::generate(),
+        );
+        let credentials = GrandSlamCredentials {
+            adsid: "123".into(),
+            idms_token: "test".into(),
+            pet: String::new(),
+        };
+        for code in ["", "12345", "1234567", "12a456", "１２３４５６"] {
+            assert!(
+                account
+                    .submit_second_factor(SecondFactor::Sms, code, &credentials)
+                    .await
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn extracts_strings_and_integer_identifiers() {

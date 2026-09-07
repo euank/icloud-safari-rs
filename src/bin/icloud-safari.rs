@@ -43,6 +43,8 @@ enum Command {
     },
     /// Refresh saved account tokens and service settings.
     Refresh,
+    /// Show local authentication and encryption-key setup without contacting Apple.
+    Status,
     VerifyFixtures,
     ListTabs(ListArgs),
     ListDevices(ListArgs),
@@ -410,6 +412,10 @@ async fn run(cli: Cli) -> Result<()> {
             login(&store, cli.anisette_url.as_deref(), username, sms).await?
         }
         Command::Refresh => refresh(&store, cli.anisette_url.as_deref()).await?,
+        Command::Status => {
+            let session: Option<SessionState> = read_optional_state(&store, "live/session.json")?;
+            print_setup_status(&store, session.as_ref())?;
+        }
         Command::Write { command } => {
             let root = cli.fixture_dir.as_deref().unwrap_or(&state_root);
             let writer = WriteWorkspace::open(root)?;
@@ -575,26 +581,55 @@ async fn login(
     use zeroize::Zeroizing;
 
     store.ensure()?;
-    let provider = LocalOrHttpAnisette::open(store.root(), anisette_url).await?;
-    let device_path = store.root().join("live/device.json");
-    let prior = if device_path.exists() {
-        Some(store.read_json("live/device.json")?)
-    } else {
-        None
-    };
-    let device = provider.device_state(prior).await?;
+    let previous: Option<SessionState> = read_optional_state(store, "live/session.json")?;
+    let prior: Option<DeviceState> = read_optional_state(store, "live/device.json")?;
+    if previous.is_some() && prior.is_none() {
+        return Err(Error::Authentication(
+            "saved session has no device state; restore live/device.json or use a separate --state-dir".into(),
+        ));
+    }
     let username = match username {
-        Some(value) => value,
-        None => prompt_line("Apple Account: ")?,
+        Some(value) if !value.trim().is_empty() => value.trim().to_owned(),
+        Some(_) => {
+            return Err(Error::Authentication(
+                "Apple Account cannot be empty".into(),
+            ));
+        }
+        None => match &previous {
+            Some(session) => session.username.clone(),
+            None => prompt_line("Apple Account: ")?,
+        },
     };
+    eprintln!("Signing in as {username}");
+    let provider = LocalOrHttpAnisette::open(store.root(), anisette_url).await?;
+    let device = provider.device_state(prior.clone()).await?;
+    if let Some(prior) = &prior {
+        if previous.is_some()
+            && (prior.device_uuid != device.device_uuid
+                || prior.local_user_uuid != device.local_user_uuid)
+        {
+            return Err(Error::Authentication(
+                "Anisette identity differs from the saved device; restore the original provider/state or use a separate --state-dir".into(),
+            ));
+        }
+    } else {
+        // Persist the provisioned identity before prompting, so a cancelled
+        // or failed first login resumes with the same device next time.
+        store.write_json("live/device.json", &device)?;
+    }
     let password = Zeroizing::new(
         rpassword::prompt_password("Password: ")
             .map_err(|error| Error::Authentication(error.to_string()))?,
     );
+    if password.is_empty() {
+        return Err(Error::Authentication(
+            "login cancelled: password was empty".into(),
+        ));
+    }
     let account = AccountClient::new(ReqwestTransport::default(), provider, device.clone());
     let mut outcome = account.authenticate(&username, password.as_bytes()).await?;
     if let Some(server_factor) = outcome.second_factor {
-        let factor = if prefer_sms {
+        let mut factor = if prefer_sms {
             SecondFactor::Sms
         } else {
             server_factor
@@ -602,14 +637,31 @@ async fn login(
         account
             .trigger_second_factor(factor, &outcome.credentials)
             .await?;
-        let prompt = match factor {
-            SecondFactor::TrustedDevice => "Trusted-device verification code: ",
-            SecondFactor::Sms => "SMS verification code: ",
+        if factor == SecondFactor::TrustedDevice {
+            eprintln!("Check a trusted Apple device, or type sms below to request a text message.");
+        }
+        let code = loop {
+            let prompt = match factor {
+                SecondFactor::TrustedDevice => "Verification code (or sms; blank cancels): ",
+                SecondFactor::Sms => "SMS verification code (blank cancels): ",
+            };
+            let input = Zeroizing::new(rpassword::prompt_password(prompt)?);
+            let code = Zeroizing::new(input.trim().to_owned());
+            if code.is_empty() {
+                return Err(Error::Authentication("login cancelled".into()));
+            }
+            if factor == SecondFactor::TrustedDevice && code.eq_ignore_ascii_case("sms") {
+                account
+                    .trigger_second_factor(SecondFactor::Sms, &outcome.credentials)
+                    .await?;
+                factor = SecondFactor::Sms;
+                continue;
+            }
+            if code.len() == 6 && code.bytes().all(|byte| byte.is_ascii_digit()) {
+                break code;
+            }
+            eprintln!("Enter the six-digit verification code.");
         };
-        let code = Zeroizing::new(
-            rpassword::prompt_password(prompt)
-                .map_err(|error| Error::Authentication(error.to_string()))?,
-        );
         account
             .submit_second_factor(factor, &code, &outcome.credentials)
             .await?;
@@ -620,25 +672,84 @@ async fn login(
             ));
         }
     }
-    let mut session = account
-        .login_mobileme(&username, &outcome.credentials)
+    let session = account
+        .complete_login(&username, &outcome.credentials, previous.as_ref())
         .await?;
-    account.refresh_session(&mut session).await?;
     store.write_json("live/device.json", &device)?;
     store.write_json("live/session.json", &session)?;
-    println!("login complete; refreshable credentials saved in private local state");
+    println!("Signed in. Credentials saved; online commands refresh them automatically.");
+    print_setup_status(store, Some(&session))?;
+    Ok(())
+}
+
+fn read_optional_state<T: serde::de::DeserializeOwned>(
+    store: &FileStateStore,
+    path: &str,
+) -> Result<Option<T>> {
+    match store.read_json(path) {
+        Ok(value) => Ok(Some(value)),
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn print_setup_status(store: &FileStateStore, session: Option<&SessionState>) -> Result<()> {
+    println!("State directory: {}", store.root().display());
+    let Some(session) = session else {
+        println!("Not signed in. Run login to authenticate.");
+        return Ok(());
+    };
+    println!(
+        "Account: {} (saved credentials; status does not check token validity)",
+        session.username
+    );
+    let identities = store.root().join("pcs-identities");
+    let has_identities = match fs::read_dir(&identities) {
+        Ok(entries) => {
+            let mut found = false;
+            for entry in entries {
+                let path = entry?.path();
+                found |=
+                    path.extension().is_some_and(|extension| extension == "der") && path.is_file();
+            }
+            found
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    println!(
+        "Safari keys: {}",
+        if has_identities {
+            "identity files present (not verified)"
+        } else {
+            "missing"
+        }
+    );
+    let has_octagon = session.extra.contains_key("octagon");
+    let has_user = session
+        .mme
+        .extra
+        .get("cloudKitUserId")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.is_empty());
+    println!(
+        "Password enrollment: {}",
+        if has_octagon && has_user {
+            "saved state present (not verified)"
+        } else {
+            "missing"
+        }
+    );
+    if !has_identities || !has_octagon || !has_user {
+        println!(
+            "Authentication alone does not recover encryption keys. Fresh-account enrollment is not implemented yet; see README.md (Encryption-key setup)."
+        );
+    }
     Ok(())
 }
 
 async fn refresh(store: &FileStateStore, anisette_url: Option<&str>) -> Result<()> {
-    store.ensure()?;
-    let provider = LocalOrHttpAnisette::open(store.root(), anisette_url).await?;
-    let device: DeviceState = store.read_json("live/device.json")?;
-    let mut session: SessionState = store.read_json("live/session.json")?;
-    AccountClient::new(ReqwestTransport::default(), provider, device)
-        .refresh_session(&mut session)
-        .await?;
-    store.write_json("live/session.json", &session)?;
+    live_context(store, anisette_url).await?;
     println!("refreshed saved account tokens and service settings");
     Ok(())
 }
@@ -647,10 +758,12 @@ async fn live_context(
     store: &FileStateStore,
     anisette_url: Option<&str>,
 ) -> Result<(LocalOrHttpAnisette, DeviceState, SessionState)> {
-    store.ensure()?;
+    let mut session: SessionState = read_optional_state(store, "live/session.json")?
+        .ok_or_else(|| Error::Authentication("not signed in; run login first".into()))?;
+    let device: DeviceState = read_optional_state(store, "live/device.json")?.ok_or_else(|| {
+        Error::Authentication("saved session has no device state; restore live/device.json".into())
+    })?;
     let provider = LocalOrHttpAnisette::open(store.root(), anisette_url).await?;
-    let device: DeviceState = store.read_json("live/device.json")?;
-    let mut session: SessionState = store.read_json("live/session.json")?;
     AccountClient::new(
         ReqwestTransport::default(),
         provider.clone(),
@@ -870,6 +983,32 @@ fn prompt_line(prompt: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn missing_login_fails_before_anisette_or_network() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = FileStateStore::new(temporary.path().join("missing"));
+        let result = live_context(&store, Some("http://127.0.0.1:1")).await;
+        assert!(
+            matches!(result, Err(Error::Authentication(message)) if message.contains("run login"))
+        );
+        assert!(!store.root().exists());
+    }
+
+    #[test]
+    fn malformed_saved_state_is_not_treated_as_a_new_account() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = FileStateStore::new(temporary.path());
+        store
+            .write_json("live/session.json", &serde_json::json!({"broken": true}))
+            .unwrap();
+        assert!(read_optional_state::<SessionState>(&store, "live/session.json").is_err());
+        assert!(
+            read_optional_state::<SessionState>(&store, "missing.json")
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn online_is_the_default_but_explicit_offline_sources_win() {
