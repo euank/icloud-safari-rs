@@ -12,7 +12,6 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
 };
-#[cfg(feature = "experimental-live-writes")]
 use zeroize::Zeroizing;
 
 #[derive(Debug, Parser)]
@@ -37,6 +36,9 @@ enum Command {
     Login {
         #[arg(long)]
         username: Option<String>,
+        /// Read the Apple Account password from an owner-only file, not argv.
+        #[arg(long)]
+        password_file: Option<PathBuf>,
         /// Request an SMS code instead of notifying trusted Apple devices.
         #[arg(long)]
         sms: bool,
@@ -85,6 +87,7 @@ enum Command {
         #[command(subcommand)]
         command: EscrowCommand,
     },
+    #[cfg(feature = "experimental-live-writes")]
     Octagon {
         #[command(subcommand)]
         command: OctagonCommand,
@@ -171,13 +174,31 @@ enum AuthCommand {
 enum EscrowCommand {
     List,
 }
+#[cfg(feature = "experimental-live-writes")]
 #[derive(Debug, Subcommand)]
 enum OctagonCommand {
+    /// Recover an escrow bottle and join the existing trust circle.
+    #[cfg(feature = "experimental-live-writes")]
     Enroll {
         #[arg(long)]
         bottle_id: String,
         #[arg(long)]
         confirm_escrow_recovery: Option<String>,
+        /// Request SMS during the fresh authentication needed for escrow.
+        #[arg(long)]
+        sms: bool,
+        /// Read the Apple Account password from an owner-only file.
+        #[arg(long)]
+        password_file: Option<PathBuf>,
+        /// Read the known device passcode from an owner-only file. Never guess.
+        #[arg(long)]
+        device_passcode_file: Option<PathBuf>,
+        /// Refresh a stale pending peer's trust data, preserving its identity.
+        #[arg(long)]
+        refresh_trust: bool,
+        /// Explicitly authorize one more escrow attempt after an unresolved failure.
+        #[arg(long)]
+        retry_escrow_recovery: bool,
     },
 }
 #[derive(Debug, Subcommand)]
@@ -268,8 +289,40 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    if cli.fixture_dir.is_some()
+        && !matches!(
+            &cli.command,
+            Command::VerifyFixtures
+                | Command::ListTabs(_)
+                | Command::ListDevices(_)
+                | Command::ListBookmarks(_)
+                | Command::ListHistory(_)
+                | Command::Export { .. }
+                | Command::Write {
+                    command: WriteCommand::Update { .. } | WriteCommand::Delete { .. }
+                }
+        )
+    {
+        return Err(Error::Unsupported(
+            "--fixture-dir is only valid for offline Safari reads, verification and write-plan preparation; remove it to explicitly use a live command",
+        ));
+    }
     let state_root = cli.state_dir.unwrap_or_else(default_state_dir);
     let store = FileStateStore::new(&state_root);
+    let writes_state = match &cli.command {
+        Command::Status | Command::VerifyFixtures => false,
+        Command::ListTabs(args)
+        | Command::ListDevices(args)
+        | Command::ListBookmarks(args)
+        | Command::ListHistory(args) => should_fetch(args.offline, args.fetch, &cli.fixture_dir),
+        Command::Export { offline, fetch, .. } => should_fetch(*offline, *fetch, &cli.fixture_dir),
+        _ => true,
+    };
+    let _state_lock = if writes_state {
+        Some(store.try_lock()?)
+    } else {
+        None
+    };
     match cli.command {
         Command::Device {
             command: DeviceCommand::Init,
@@ -408,8 +461,19 @@ async fn run(cli: Cli) -> Result<()> {
             println!("exported decoded JSON to {}", destination.display())
         }
         Command::Fetch { dataset } => fetch(&store, cli.anisette_url.as_deref(), dataset).await?,
-        Command::Login { username, sms } => {
-            login(&store, cli.anisette_url.as_deref(), username, sms).await?
+        Command::Login {
+            username,
+            sms,
+            password_file,
+        } => {
+            login(
+                &store,
+                cli.anisette_url.as_deref(),
+                username,
+                sms,
+                password_file.as_deref(),
+            )
+            .await?
         }
         Command::Refresh => refresh(&store, cli.anisette_url.as_deref()).await?,
         Command::Status => {
@@ -549,14 +613,59 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Auth {
             command: AuthCommand::Login,
-        } => login(&store, cli.anisette_url.as_deref(), None, false).await?,
+        } => login(&store, cli.anisette_url.as_deref(), None, false, None).await?,
         Command::Auth {
             command: AuthCommand::Refresh,
         } => refresh(&store, cli.anisette_url.as_deref()).await?,
-        Command::Escrow { .. } | Command::Octagon { .. } | Command::Keys { .. } => {
-            return Err(Error::Unsupported(
-                "Octagon enrollment is not yet available; supply existing PCS identities",
-            ));
+        Command::Escrow {
+            command: EscrowCommand::List,
+        } => {
+            let client = enrollment_client(&store, cli.anisette_url.as_deref()).await?;
+            let bottles = icloud_safari::enrollment::list_bottles(&client).await?;
+            let summaries: Vec<_> = bottles.iter().map(|bottle| serde_json::json!({
+                "label": bottle.label, "bottle_id": bottle.bottle_id, "peer_id": bottle.peer_id
+            })).collect();
+            println!("{}", serde_json::to_string_pretty(&summaries)?);
+        }
+        Command::Keys {
+            command: KeysCommand::Recover,
+        } => {
+            recover_safari_keys(&store, cli.anisette_url.as_deref()).await?;
+        }
+        #[cfg(feature = "experimental-live-writes")]
+        Command::Octagon {
+            command:
+                OctagonCommand::Enroll {
+                    bottle_id,
+                    confirm_escrow_recovery,
+                    sms,
+                    password_file,
+                    device_passcode_file,
+                    refresh_trust,
+                    retry_escrow_recovery,
+                },
+        } => {
+            if !cfg!(feature = "experimental-live-writes") {
+                return Err(Error::Unsupported(
+                    "enrollment requires the experimental-live-writes feature",
+                ));
+            }
+            if confirm_escrow_recovery.as_deref() != Some(&bottle_id) {
+                return Err(Error::Authentication("--confirm-escrow-recovery must exactly match --bottle-id; recovery spends a rate-limited passcode attempt and joins the trust circle".into()));
+            }
+            enroll(
+                &store,
+                cli.anisette_url.as_deref(),
+                &bottle_id,
+                sms,
+                password_file.as_deref(),
+                device_passcode_file.as_deref(),
+                EnrollmentOptions {
+                    refresh_trust,
+                    retry_escrow_recovery,
+                },
+            )
+            .await?;
         }
     }
     Ok(())
@@ -564,8 +673,8 @@ async fn run(cli: Cli) -> Result<()> {
 fn reader<'a>(fixture: &'a Option<PathBuf>, state: &'a Path) -> Result<OfflineReader> {
     OfflineReader::open(fixture.as_deref().unwrap_or(state))
 }
-fn should_fetch(offline: bool, force_fetch: bool, fixture: &Option<PathBuf>) -> bool {
-    force_fetch || (!offline && fixture.is_none())
+fn should_fetch(offline: bool, _force_fetch: bool, fixture: &Option<PathBuf>) -> bool {
+    !offline && fixture.is_none()
 }
 fn default_state_dir() -> PathBuf {
     directories::ProjectDirs::from("dev", "icloud-safari", "icloud-safari")
@@ -577,7 +686,19 @@ async fn login(
     anisette_url: Option<&str>,
     username: Option<String>,
     prefer_sms: bool,
+    password_file: Option<&Path>,
 ) -> Result<()> {
+    login_credentials(store, anisette_url, username, prefer_sms, password_file).await?;
+    Ok(())
+}
+
+async fn login_credentials(
+    store: &FileStateStore,
+    anisette_url: Option<&str>,
+    username: Option<String>,
+    prefer_sms: bool,
+    password_file: Option<&Path>,
+) -> Result<icloud_safari::account::GrandSlamCredentials> {
     use zeroize::Zeroizing;
 
     store.ensure()?;
@@ -617,10 +738,7 @@ async fn login(
         // or failed first login resumes with the same device next time.
         store.write_json("live/device.json", &device)?;
     }
-    let password = Zeroizing::new(
-        rpassword::prompt_password("Password: ")
-            .map_err(|error| Error::Authentication(error.to_string()))?,
-    );
+    let password = read_password(password_file, "Password: ")?;
     if password.is_empty() {
         return Err(Error::Authentication(
             "login cancelled: password was empty".into(),
@@ -679,7 +797,314 @@ async fn login(
     store.write_json("live/session.json", &session)?;
     println!("Signed in. Credentials saved; online commands refresh them automatically.");
     print_setup_status(store, Some(&session))?;
+    Ok(outcome.credentials)
+}
+
+type EnrollmentClient =
+    icloud_safari::keychain::KeychainClient<ReqwestTransport, LocalOrHttpAnisette>;
+
+async fn enrollment_client(
+    store: &FileStateStore,
+    anisette_url: Option<&str>,
+) -> Result<EnrollmentClient> {
+    let (provider, device, session) = live_context(store, anisette_url).await?;
+    let client =
+        EnrollmentClient::initialize(ReqwestTransport::default(), provider, device, session)
+            .await?;
+    store.write_json("live/session.json", client.session())?;
+    Ok(client)
+}
+
+async fn recover_safari_keys(store: &FileStateStore, anisette_url: Option<&str>) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let client = enrollment_client(store, anisette_url).await?;
+    let identities = client.recover_pcs_identities().await?;
+    // Validate the whole recovery before touching files. Hash names are stable
+    // across retries and do not reveal a service label or private key.
+    for identity in &identities {
+        store.write_bytes(
+            format!(
+                "pcs-identities/{}.der",
+                hex::encode(Sha256::digest(&**identity))
+            ),
+            identity,
+        )?;
+    }
+    println!(
+        "Recovered and saved {} authenticated PCS identities.",
+        identities.len()
+    );
     Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PendingEnrollment {
+    dsid: String,
+    bottle_id: String,
+    enrollment: icloud_safari::enrollment::Enrollment,
+}
+
+fn checkpoint_matches_account(session: &SessionState, checkpoint_dsid: &str) -> bool {
+    if checkpoint_dsid.is_empty() {
+        return false;
+    }
+    if checkpoint_dsid == session.mme.dsid {
+        return true;
+    }
+    // Historical sessions stored ADSID in the top-level DSID slot. Only
+    // accept that alias when bound by authenticated account settings.
+    session
+        .mme
+        .extra
+        .get("accountSettings")
+        .and_then(|settings| settings.get("appleAccountInfo"))
+        .and_then(|info| info.get("aDsID"))
+        .and_then(serde_json::Value::as_str)
+        == Some(checkpoint_dsid)
+}
+
+fn validate_pending_session(session: &SessionState, pending: &PendingEnrollment) -> Result<()> {
+    if !checkpoint_matches_account(session, &pending.dsid) {
+        return Err(Error::Authentication(
+            "saved enrollment checkpoint belongs to another account".into(),
+        ));
+    }
+    if let Some(existing) = session.extra.get("octagon") {
+        use base64::Engine as _;
+        let mismatch = || {
+            Error::Authentication("saved session and pending enrollment contain different identities; refusing to overwrite either identity".into())
+        };
+        let existing: icloud_safari::enrollment::Enrollment =
+            serde_json::from_value(existing.clone()).map_err(|_| mismatch())?;
+        let candidate = &pending.enrollment;
+        if existing.peer_id != candidate.peer_id
+            || existing.keys.signing_priv_x963 != candidate.keys.signing_priv_x963
+            || existing.keys.encryption_priv_x963 != candidate.keys.encryption_priv_x963
+            || existing.sponsor.peer_id != candidate.sponsor.peer_id
+            || existing.sponsor.signing_priv_x963 != candidate.sponsor.signing_priv_x963
+            || existing.sponsor.encryption_priv_x963 != candidate.sponsor.encryption_priv_x963
+            || existing.recovery_identities.len() != candidate.recovery_identities.len()
+            || existing
+                .recovery_identities
+                .iter()
+                .zip(&candidate.recovery_identities)
+                .any(|(a, b)| {
+                    a.peer_id != b.peer_id || a.encryption_priv_x963 != b.encryption_priv_x963
+                })
+        {
+            return Err(mismatch());
+        }
+        if existing.peer_base64 != candidate.peer_base64 {
+            let decode = |encoded: &str| {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .map_err(|_| mismatch())?;
+                icloud_safari::wire::Message::parse(&bytes).map_err(|_| mismatch())
+            };
+            let old = decode(&existing.peer_base64)?;
+            let new = decode(&candidate.peer_base64)?;
+            // Refresh may change stable/dynamic metadata, never identity,
+            // signed permanent information, or the sponsor's voucher.
+            for field in [1, 2, 5] {
+                if old.first_bytes(field).is_none()
+                    || old.values(field).collect::<Vec<_>>()
+                        != new.values(field).collect::<Vec<_>>()
+                {
+                    return Err(mismatch());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "experimental-live-writes")]
+#[derive(serde::Serialize, serde::Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+struct RecoveryCheckpoint {
+    dsid: String,
+    adsid: String,
+    #[zeroize(skip)]
+    bottle: icloud_safari::enrollment::Bottle,
+    entropy_base64: String,
+}
+
+#[cfg(feature = "experimental-live-writes")]
+struct EnrollmentOptions {
+    refresh_trust: bool,
+    retry_escrow_recovery: bool,
+}
+
+#[cfg(feature = "experimental-live-writes")]
+async fn enroll(
+    store: &FileStateStore,
+    anisette_url: Option<&str>,
+    bottle_id: &str,
+    sms: bool,
+    password_file: Option<&Path>,
+    device_passcode_file: Option<&Path>,
+    options: EnrollmentOptions,
+) -> Result<()> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let mut client = enrollment_client(store, anisette_url).await?;
+    let pending: Option<PendingEnrollment> = read_optional_state(store, "enrollment/pending.json")?;
+    let mut pending = if let Some(pending) = pending {
+        validate_pending_session(client.session(), &pending)?;
+        if pending.bottle_id != bottle_id {
+            return Err(Error::Authentication("saved pending enrollment belongs to another account or bottle; resume it using its original --bottle-id".into()));
+        }
+        eprintln!("Resuming the saved peer; escrow recovery will not be repeated.");
+        pending
+    } else {
+        if client.session().extra.contains_key("octagon") {
+            return Err(Error::Authentication("Octagon identity already exists; use keys recover instead of creating another peer".into()));
+        }
+        let recovery: Option<RecoveryCheckpoint> =
+            read_optional_state(store, "enrollment/recovery.json")?;
+        let recovery = if let Some(recovery) = recovery {
+            if !checkpoint_matches_account(client.session(), &recovery.dsid)
+                || recovery.bottle.bottle_id != bottle_id
+            {
+                return Err(Error::Authentication("saved recovery belongs to another account or bottle; use its original --bottle-id".into()));
+            }
+            eprintln!("Resuming the saved recovered bottle; no passcode attempt will be repeated.");
+            recovery
+        } else {
+            let previous_attempt: Option<serde_json::Value> =
+                read_optional_state(store, "enrollment/attempt.json")?;
+            if let Some(attempt) = &previous_attempt {
+                if !attempt["dsid"]
+                    .as_str()
+                    .is_some_and(|dsid| checkpoint_matches_account(client.session(), dsid))
+                    || attempt["bottle_id"].as_str() != Some(bottle_id)
+                {
+                    return Err(Error::Authentication(
+                        "previous escrow attempt belongs to another account or bottle".into(),
+                    ));
+                }
+                if !options.retry_escrow_recovery {
+                    return Err(Error::Authentication("a prior escrow attempt has no saved recovery result; refusing another attempt. Investigate first; --retry-escrow-recovery explicitly authorizes one more rate-limited attempt and preserves its history".into()));
+                }
+            }
+            let bottles = icloud_safari::enrollment::list_bottles(&client).await?;
+            let mut selected = bottles
+                .into_iter()
+                .filter(|bottle| bottle.bottle_id == bottle_id);
+            let bottle = selected.next().ok_or(Error::Authentication(
+                "bottle is not viable; run escrow list".into(),
+            ))?;
+            if selected.next().is_some() {
+                return Err(Error::Authentication(
+                    "bottle selection is ambiguous".into(),
+                ));
+            }
+            icloud_safari::enrollment::fetch_directory(&client).await?;
+            eprintln!(
+                "Fresh Apple Account authentication is required for escrow. The device passcode will be requested separately."
+            );
+            let credentials =
+                login_credentials(store, anisette_url, None, sms, password_file).await?;
+            let (provider, device, session) = live_context(store, anisette_url).await?;
+            // Container initialization was preserved by same-account login.
+            let escrow = icloud_safari::enrollment::escrow::EscrowClient::new(
+                ReqwestTransport::default(),
+                provider.clone(),
+                device.clone(),
+                &session,
+                &credentials,
+            )?;
+            // Verify the exact record label still exists before spending an attempt.
+            let records = escrow.records().await?;
+            if let Some(model) = icloud_safari::enrollment::escrow::record_model(
+                &records,
+                &bottle.label,
+                &bottle.bottle_id,
+            )? {
+                eprintln!("Escrow device model: {model}");
+            }
+            eprintln!(
+                "Recovering bottle {}. Enter the passcode/password of the device that created this record. One recovery attempt will be made.",
+                bottle.bottle_id
+            );
+            let passcode = read_password(
+                device_passcode_file,
+                "Device passcode/password (blank cancels): ",
+            )?;
+            if passcode.is_empty() {
+                return Err(Error::Authentication("enrollment cancelled".into()));
+            }
+            if let Some(attempt) = previous_attempt {
+                store.write_json(
+                    format!("enrollment/attempt-history/{}.json", uuid::Uuid::new_v4()),
+                    &attempt,
+                )?;
+            }
+            let mut attempt = serde_json::json!({
+                "dsid": session.mme.dsid, "bottle_id": bottle_id,
+                "started_at": chrono::Utc::now().to_rfc3339(),
+            });
+            store.write_json("enrollment/attempt.json", &attempt)?;
+            let entropy = match escrow.recover(&bottle.label, passcode.as_bytes()).await {
+                Ok(entropy) => entropy,
+                Err(error) => {
+                    attempt["last_error"] = serde_json::Value::String(error.to_string());
+                    store.write_json("enrollment/attempt.json", &attempt)?;
+                    return Err(error);
+                }
+            };
+            let recovery = RecoveryCheckpoint {
+                dsid: session.mme.dsid.clone(),
+                adsid: credentials.adsid.clone(),
+                bottle,
+                entropy_base64: STANDARD.encode(&*entropy),
+            };
+            // Persist successful recovery before any parsing, policy or join work.
+            store.write_json("enrollment/recovery.json", &recovery)?;
+            recovery
+        };
+        client = enrollment_client(store, anisette_url).await?;
+        let directory = icloud_safari::enrollment::fetch_directory(&client).await?;
+        let device: DeviceState = store.read_json("live/device.json")?;
+        let entropy = Zeroizing::new(
+            STANDARD
+                .decode(&recovery.entropy_base64)
+                .map_err(|_| Error::Integrity)?,
+        );
+        let enrollment = icloud_safari::enrollment::prepare_enrollment(
+            &recovery.bottle,
+            &entropy,
+            &recovery.adsid,
+            &device,
+            &directory,
+        )?;
+        let pending = PendingEnrollment {
+            dsid: client.session().mme.dsid.clone(),
+            bottle_id: bottle_id.into(),
+            enrollment,
+        };
+        store.write_json("enrollment/pending.json", &pending)?;
+        pending
+    };
+    // A crash may occur after pending.json was committed but before session.json.
+    if options.refresh_trust {
+        let directory = icloud_safari::enrollment::fetch_directory(&client).await?;
+        icloud_safari::enrollment::refresh_enrollment(&mut pending.enrollment, &directory)?;
+        store.write_json("enrollment/pending.json", &pending)?;
+    }
+    let mut session = client.session().clone();
+    session
+        .extra
+        .insert("octagon".into(), serde_json::to_value(&pending.enrollment)?);
+    store.write_json("live/session.json", &session)?;
+    client = enrollment_client(store, anisette_url).await?;
+    icloud_safari::enrollment::join(&client, &mut pending.enrollment).await?;
+    store.write_json("enrollment/pending.json", &pending)?;
+    let mut session = client.session().clone();
+    session
+        .extra
+        .insert("octagon".into(), serde_json::to_value(&pending.enrollment)?);
+    store.write_json("live/session.json", &session)?;
+    println!("Octagon enrollment confirmed.");
+    recover_safari_keys(store, anisette_url).await
 }
 
 fn read_optional_state<T: serde::de::DeserializeOwned>(
@@ -726,6 +1151,30 @@ fn print_setup_status(store: &FileStateStore, session: Option<&SessionState>) ->
         }
     );
     let has_octagon = session.extra.contains_key("octagon");
+    let pending: Option<PendingEnrollment> = read_optional_state(store, "enrollment/pending.json")?;
+    let joined = session
+        .extra
+        .get("octagon")
+        .and_then(|peer| peer.get("joined"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    if let Some(pending) = &pending {
+        validate_pending_session(session, pending)?;
+        if !joined {
+            println!(
+                "Octagon join pending. Resume octagon enroll with --bottle-id {} and matching --confirm-escrow-recovery.",
+                pending.bottle_id
+            );
+        }
+    } else if store.root().join("enrollment/recovery.json").try_exists()? {
+        println!(
+            "Recovered bottle checkpoint present; rerun octagon enroll to prepare and join without another passcode attempt."
+        );
+    } else if store.root().join("enrollment/attempt.json").try_exists()? {
+        println!(
+            "Escrow attempt has no recovery checkpoint. Automatic retry is blocked; inspect the previous failure before authorizing another attempt."
+        );
+    }
     let has_user = session
         .mme
         .extra
@@ -734,15 +1183,17 @@ fn print_setup_status(store: &FileStateStore, session: Option<&SessionState>) ->
         .is_some_and(|value| !value.is_empty());
     println!(
         "Password enrollment: {}",
-        if has_octagon && has_user {
-            "saved state present (not verified)"
+        if has_octagon && has_user && joined {
+            "joined state present (not verified online)"
+        } else if has_octagon {
+            "saved identity present; join not confirmed"
         } else {
             "missing"
         }
     );
     if !has_identities || !has_octagon || !has_user {
         println!(
-            "Authentication alone does not recover encryption keys. Fresh-account enrollment is not implemented yet; see README.md (Encryption-key setup)."
+            "Authentication alone does not recover encryption keys. Use escrow list and octagon enroll for a new peer, or keys recover for existing enrollment; see README.md (Encryption-key setup)."
         );
     }
     Ok(())
@@ -869,13 +1320,29 @@ async fn keychain_client(
     )
 }
 
-#[cfg(feature = "experimental-live-writes")]
 fn read_password(path: Option<&Path>, prompt: &str) -> Result<Zeroizing<String>> {
+    use std::io::Read;
     let mut password = if let Some(path) = path {
-        String::from_utf8(fs::read(path)?)
-            .map_err(|_| Error::Fixture("password file is not UTF-8".into()))?
+        if fs::symlink_metadata(path)?.file_type().is_symlink() {
+            return Err(Error::UnsafePermissions(path.into()));
+        }
+        let mut file = fs::File::open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(Error::UnsafePermissions(path.into()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err(Error::UnsafePermissions(path.into()));
+            }
+        }
+        let mut secret = Zeroizing::new(String::new());
+        file.read_to_string(&mut secret)?;
+        secret
     } else {
-        rpassword::prompt_password(prompt)?
+        Zeroizing::new(rpassword::prompt_password(prompt)?)
     };
     if password.ends_with('\n') {
         password.pop();
@@ -886,7 +1353,7 @@ fn read_password(path: Option<&Path>, prompt: &str) -> Result<Zeroizing<String>>
     if password.is_empty() {
         return Err(Error::Fixture("password must not be empty".into()));
     }
-    Ok(Zeroizing::new(password))
+    Ok(password)
 }
 
 #[cfg(feature = "experimental-live-writes")]
@@ -944,26 +1411,54 @@ fn output<T: serde::Serialize + std::fmt::Debug>(value: &T, json: bool) -> Resul
     Ok(())
 }
 fn write_secure_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?
+    // Serialize before touching the destination: a failing serializer must not
+    // truncate an existing export. Only the private replacement inode is written.
+    let mut bytes = Zeroizing::new(serde_json::to_vec_pretty(value)?);
+    bytes.push(b'\n');
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::Fixture("output path must name a file".into()))?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+            return Err(Error::UnsafePermissions(path.into()));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(
+        ".{}.tmp-{}",
+        name.to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let mut file = options.open(&temporary)?;
+    let result = (|| -> Result<()> {
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        // This unique temporary path was created by this invocation. A successful
+        // rename already removed it; never remove the destination on failure.
+        let _ = fs::remove_file(&temporary);
     }
-    serde_json::to_writer_pretty(&mut file, value)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    Ok(())
+    result
 }
 
 fn prompt_line(prompt: &str) -> Result<String> {
@@ -983,6 +1478,284 @@ fn prompt_line(prompt: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_export_serialization_preserves_existing_output() {
+        struct InvalidExport;
+        impl serde::Serialize for InvalidExport {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                _: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("synthetic serialization failure"))
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("output.json");
+        fs::write(&path, b"original").unwrap();
+        assert!(write_secure_json(&path, &InvalidExport).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn export_refuses_directory_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("existing-directory");
+        fs::create_dir(&target).unwrap();
+        assert!(write_secure_json(&target, &serde_json::json!({"value": "private"})).is_err());
+        assert!(target.is_dir());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exports_replace_privately_and_atomically_without_chmod_parent() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let path = temp.path().join("output.json");
+        fs::write(&path, b"original").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut old = fs::File::open(&path).unwrap();
+        write_secure_json(&path, &serde_json::json!({"value": "private"})).unwrap();
+        let mut original = Vec::new();
+        old.read_to_end(&mut original).unwrap();
+        assert_eq!(original, b"original");
+        let updated: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(updated["value"], "private");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(temp.path()).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exports_reject_symlinks_without_modifying_targets() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.json");
+        let link = temp.path().join("link.json");
+        fs::write(&target, b"original").unwrap();
+        symlink(&target, &link).unwrap();
+        assert!(write_secure_json(&link, &serde_json::json!({"value": "private"})).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_export_rename_cleans_only_its_temporary_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let unrelated = temp.path().join("keep");
+        fs::write(&unrelated, b"unchanged").unwrap();
+        // A trailing slash requires a directory at rename time. The destination
+        // is absent, so the file rename fails after its temporary file is saved.
+        let target = temp.path().join("not-a-directory/");
+        assert!(write_secure_json(&target, &serde_json::json!({"value": "private"})).is_err());
+        assert_eq!(fs::read(&unrelated).unwrap(), b"unchanged");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn pending_peer_cannot_overwrite_another_saved_identity() {
+        let mut session: SessionState = serde_json::from_value(serde_json::json!({
+            "username":"test@example.invalid", "dsid":"123",
+            "mme":{"dsid":"123", "mmeAuthToken":"synthetic", "tokens":{}}
+        }))
+        .unwrap();
+        let pending: PendingEnrollment = serde_json::from_value(serde_json::json!({
+            "dsid":"123", "bottle_id":"synthetic", "enrollment": {
+                "peer_id":"new-peer", "keys":{"signing_priv_x963":"", "encryption_priv_x963":""},
+                "sponsor":{"peer_id":"sponsor", "signing_priv_x963":"", "encryption_priv_x963":""},
+                "joined":false, "peer_base64":""
+            }
+        }))
+        .unwrap();
+        assert!(validate_pending_session(&session, &pending).is_ok());
+        session.extra.insert(
+            "octagon".into(),
+            serde_json::json!({"peer_id":"different-peer"}),
+        );
+        assert!(validate_pending_session(&session, &pending).is_err());
+        session.extra.insert(
+            "octagon".into(),
+            serde_json::to_value(&pending.enrollment).unwrap(),
+        );
+        assert!(validate_pending_session(&session, &pending).is_ok());
+        for (section, field) in [
+            ("keys", "signing_priv_x963"),
+            ("keys", "encryption_priv_x963"),
+            ("sponsor", "peer_id"),
+            ("sponsor", "signing_priv_x963"),
+            ("sponsor", "encryption_priv_x963"),
+        ] {
+            let mut altered = serde_json::to_value(&pending.enrollment).unwrap();
+            altered[section][field] = serde_json::json!("different");
+            session.extra.insert("octagon".into(), altered);
+            assert!(validate_pending_session(&session, &pending).is_err());
+        }
+        session.extra.insert(
+            "octagon".into(),
+            serde_json::to_value(&pending.enrollment).unwrap(),
+        );
+        session.mme.dsid = "456".into();
+        assert!(validate_pending_session(&session, &pending).is_err());
+    }
+
+    #[test]
+    fn checkpoints_accept_only_authenticated_legacy_account_alias() {
+        let mut session: SessionState = serde_json::from_value(serde_json::json!({
+            "username":"test@example.invalid", "dsid":"untrusted-alias",
+            "mme":{"dsid":"123", "mmeAuthToken":"synthetic", "tokens":{},
+                "accountSettings":{"appleAccountInfo":{"aDsID":"legacy-adsid"}}}
+        }))
+        .unwrap();
+        assert!(checkpoint_matches_account(&session, "123"));
+        assert!(checkpoint_matches_account(&session, "legacy-adsid"));
+        assert!(!checkpoint_matches_account(&session, "untrusted-alias"));
+        assert!(!checkpoint_matches_account(&session, ""));
+        session.dsid = "123".into();
+        assert!(checkpoint_matches_account(&session, "legacy-adsid"));
+        session.mme.extra.clear();
+        assert!(!checkpoint_matches_account(&session, "legacy-adsid"));
+    }
+
+    #[test]
+    fn pending_refresh_preserves_immutable_peer_fields() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let mut session: SessionState = serde_json::from_value(serde_json::json!({
+            "username":"test@example.invalid", "dsid":"123",
+            "mme":{"dsid":"123", "mmeAuthToken":"synthetic", "tokens":{}}
+        }))
+        .unwrap();
+        let peer = |changed: u32| {
+            let mut bytes = Vec::new();
+            for field in 1..=5 {
+                icloud_safari::wire::encode_bytes(
+                    field,
+                    if field == changed {
+                        b"changed"
+                    } else {
+                        b"original"
+                    },
+                    &mut bytes,
+                );
+            }
+            STANDARD.encode(bytes)
+        };
+        let mut pending: PendingEnrollment = serde_json::from_value(serde_json::json!({
+            "dsid":"123", "bottle_id":"synthetic", "enrollment": {
+                "peer_id":"new-peer", "keys":{"signing_priv_x963":"", "encryption_priv_x963":""},
+                "sponsor":{"peer_id":"sponsor", "signing_priv_x963":"", "encryption_priv_x963":""},
+                "joined":false, "peer_base64":peer(0)
+            }
+        }))
+        .unwrap();
+        session.extra.insert(
+            "octagon".into(),
+            serde_json::to_value(&pending.enrollment).unwrap(),
+        );
+        for field in 1..=5 {
+            pending.enrollment.peer_base64 = peer(field);
+            assert_eq!(
+                validate_pending_session(&session, &pending).is_ok(),
+                matches!(field, 3 | 4)
+            );
+        }
+        pending.enrollment.peer_base64 = peer(0);
+        pending.enrollment.joined = true;
+        assert!(validate_pending_session(&session, &pending).is_ok());
+        pending
+            .enrollment
+            .recovery_identities
+            .push(icloud_safari::enrollment::RecoveryIdentity {
+                peer_id: "unexpected".into(),
+                encryption_priv_x963: "synthetic".into(),
+            });
+        assert!(validate_pending_session(&session, &pending).is_err());
+    }
+
+    #[tokio::test]
+    async fn fixture_flag_rejects_live_commands_before_creating_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("must-not-exist");
+        for args in [
+            vec!["login"],
+            vec!["refresh"],
+            vec!["passwords", "list"],
+            vec!["escrow", "list"],
+            vec!["keys", "recover"],
+        ] {
+            let mut argv = vec![
+                "icloud-safari",
+                "--state-dir",
+                root.to_str().unwrap(),
+                "--fixture-dir",
+                "fixtures/private",
+            ];
+            argv.extend(args);
+            let parsed = Cli::try_parse_from(argv).unwrap();
+            assert!(matches!(run(parsed).await, Err(Error::Unsupported(_))));
+            assert!(!root.exists());
+        }
+    }
+
+    #[test]
+    fn file_password_preserves_content_and_rejects_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = FileStateStore::new(temp.path());
+        store.write_bytes("password", b" spaces stay \r\n").unwrap();
+        assert_eq!(
+            &*read_password(Some(&temp.path().join("password")), "unused").unwrap(),
+            " spaces stay "
+        );
+        store.write_bytes("password", b"\n").unwrap();
+        assert!(read_password(Some(&temp.path().join("password")), "unused").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_password_rejects_public_permissions_and_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let temp = tempfile::tempdir().unwrap();
+        let store = FileStateStore::new(temp.path());
+        store.write_bytes("password", b"synthetic").unwrap();
+        let path = temp.path().join("password");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            read_password(Some(&path), "unused"),
+            Err(Error::UnsafePermissions(_))
+        ));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&path, temp.path().join("link")).unwrap();
+        assert!(matches!(
+            read_password(Some(&temp.path().join("link")), "unused"),
+            Err(Error::UnsafePermissions(_))
+        ));
+    }
+
+    #[cfg(not(feature = "experimental-live-writes"))]
+    #[test]
+    fn readonly_cli_does_not_expose_enrollment() {
+        assert!(
+            Cli::try_parse_from(["icloud-safari", "octagon", "enroll", "--bottle-id", "test"])
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn missing_login_fails_before_anisette_or_network() {
@@ -1019,6 +1792,6 @@ mod tests {
             false,
             &Some(PathBuf::from("fixtures"))
         ));
-        assert!(should_fetch(false, true, &Some(PathBuf::from("fixtures"))));
+        assert!(!should_fetch(false, true, &Some(PathBuf::from("fixtures"))));
     }
 }

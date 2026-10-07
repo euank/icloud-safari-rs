@@ -8,6 +8,7 @@ pub mod ckks;
 pub mod cloudkit;
 pub mod crypto;
 pub mod der;
+pub mod enrollment;
 pub mod error;
 pub mod fixture;
 pub mod keychain;

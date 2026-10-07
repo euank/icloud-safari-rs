@@ -59,6 +59,12 @@ title. No disposable password record or Safari marker was left in the account.
 
 ## Secret handling
 
+The current library passed a fresh production create/read/update/delete test
+on 2026-09-06 with a new random password and independent deletion verification
+(`tests/live_crud.rs`). Required zone or pagination errors now propagate: a
+failed post-delete read cannot be mistaken for confirmed absence. Password
+reads fetch only Passwords and legacy Manatee, not unrelated keychain views.
+
 The CLI redacts password values unless `--show-passwords` is supplied. Mutation
 commands obtain secrets from a hidden terminal prompt or an explicitly selected
 file rather than command-line arguments. The persisted CKKS snapshot remains

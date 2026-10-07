@@ -454,10 +454,9 @@ fn preserve_account_state(
     let Some(previous) = previous else {
         return Ok(());
     };
-    if session.dsid.is_empty()
-        || session.dsid != previous.dsid
-        || session.mme.dsid != previous.mme.dsid
-    {
+    // Legacy research sessions used ADSID in the top-level `dsid` slot.
+    // The server-authenticated numeric MME DSID is the account boundary.
+    if session.mme.dsid.is_empty() || session.mme.dsid != previous.mme.dsid {
         return Err(Error::Authentication(
             "this state directory belongs to a different Apple Account; use --state-dir with a separate directory".into(),
         ));
@@ -711,6 +710,19 @@ mod tests {
             .await
             .unwrap();
         assert!(!fresh.extra.contains_key("octagon"));
+    }
+
+    #[test]
+    fn legacy_adsid_slot_does_not_block_same_mme_account() {
+        let mut old = saved_session();
+        old.dsid = "legacy-adsid".into();
+        let mut fresh = saved_session();
+        fresh.extra.clear();
+        preserve_account_state(&mut fresh, Some(&old)).unwrap();
+        assert_eq!(fresh.extra["octagon"], old.extra["octagon"]);
+        assert_ne!(fresh.dsid, old.dsid);
+        fresh.mme.dsid = "another-account".into();
+        assert!(preserve_account_state(&mut fresh, Some(&old)).is_err());
     }
 
     #[tokio::test]

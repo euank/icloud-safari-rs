@@ -41,10 +41,13 @@ protection from the above wire-format descriptions.
 Reviewed revisions: OpenTagViewer `76f7a058256735474483226dbd445c46c3e91e5a`
 and FindMy.py `ddc7f2342fc9f32ebe315b85c22a4554ce419f6d`.
 
-The prior writer passed the disposable production E2E described in
-`WRITE-PROTOCOL.md`. The replacement passes offline private-fixture creation,
-cryptographic vectors, and signature/HMAC verification; it has not had a new
-production E2E run.
+The replacement passes offline private-fixture creation, cryptographic vectors,
+and signature/HMAC verification. On 2026-09-06 it also passed a fresh production
+create/read/update/delete test for a disposable bookmark and tab, with exact
+authenticated title/URL verification and independently confirmed cleanup.
+The reproducible opt-in tests are `tests/live_crud.rs` (library) and
+`tests/live_cli_crud.rs` (actual CLI commands); both passed with all disposable
+records removed.
 
 ## CloudKit and Safari records
 
@@ -56,7 +59,21 @@ The minimum save/delete requests were then checked against disposable records
 in production. Safari record field meanings and plaintext encodings come from
 the repository's authenticated fixtures and before/after tests.
 
-## Publication note
+## Octagon enrollment and escrow recovery
+
+`src/enrollment.rs` and `src/enrollment/escrow.rs` implement the wire contracts
+documented in this repository's `PROTOCOL.md` section 13 and the MIT-licensed
+FindMy.py `keychain/{escrow,recovery,bottle,join,peers}.py` modules at revision
+`ddc7f2342fc9f32ebe315b85c22a4554ce419f6d`. The MIT OpenTagViewer keychain trust
+specification at the revision above was also consulted. Existing third-party
+notices apply. Public enrollment vectors use synthetic keys and identifiers;
+their independent Python generator is included with the tests.
+Its optional differential check uses pysrp 1.0.22's client and verifier to
+confirm SRP encoding, including short public values. The primary implementation
+is [pysrp](https://github.com/cocagne/pysrp/blob/master/srp/_pysrp.py); no pysrp
+implementation code is included or required at runtime.
+
+## Publication history
 
 The publication history starts from a fresh root commit containing the reviewed
 source tree. Old development history is retained only in a separate private

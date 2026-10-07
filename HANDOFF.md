@@ -45,7 +45,8 @@ fixtures/private/live/device.json
 
 fixtures/private/live/session.json
     Reduced live state: DSIDs, CloudKit/MME tokens, container user IDs,
-    KeychainSync URL, and persistent Octagon peer/sponsor state. It deliberately
+    KeychainSync URL. The reduced fixture currently omits Octagon state;
+    an enrolled working state additionally retains peer/recovery identities. It deliberately
     excludes passwords, PETs, unrelated app tokens, and decrypted keychain
     dumps. Bearer tokens may expire and then require account reauthentication.
 

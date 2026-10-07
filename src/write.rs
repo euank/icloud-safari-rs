@@ -152,7 +152,9 @@ impl PreparedFieldUpdate {
     /// the freshly fetched source record. This rejects hand-edited plans that
     /// alter metadata or any second field.
     pub fn validate_against_source(&self, source: &[u8]) -> Result<()> {
-        if hex::encode(Sha256::digest(source)) != self.original_record_sha256 {
+        if self.format != "icloud-safari-prepared-field-update-v1"
+            || hex::encode(Sha256::digest(source)) != self.original_record_sha256
+        {
             return Err(Error::Integrity);
         }
         let updated = STANDARD
@@ -183,11 +185,61 @@ impl PreparedFieldUpdate {
         if differences != 1 {
             return Err(Error::Integrity);
         }
+        encrypted_field(&original, &self.field_name)?;
+        encrypted_field(&changed, &self.field_name)?;
+        Ok(())
+    }
+
+    /// Bind a post-save record to the exact encrypted field that was submitted.
+    /// A changed etag alone does not prove that the requested edit was stored.
+    pub fn validate_applied_record(&self, record: &[u8]) -> Result<()> {
+        let updated = STANDARD
+            .decode(&self.updated_record_base64)
+            .map_err(|_| Error::Fixture("prepared record is not valid base64".into()))?;
+        if hex::encode(Sha256::digest(&updated)) != self.updated_record_sha256 {
+            return Err(Error::Integrity);
+        }
+        let expected = Message::parse(&updated)?;
+        let current = Message::parse(record)?;
+        let etag = current.first_bytes(1).ok_or(Error::Integrity)?;
+        if etag.is_empty()
+            || etag == self.metadata.etag.as_bytes()
+            || current.values(1).count() != 1
+            || current.values(2).count() != 1
+            || current.values(3).count() != 1
+            || current.first_bytes(2) != expected.first_bytes(2)
+            || current.first_bytes(3) != expected.first_bytes(3)
+            || encrypted_field(&current, &self.field_name)?
+                != encrypted_field(&expected, &self.field_name)?
+        {
+            return Err(Error::Integrity);
+        }
         Ok(())
     }
 }
 
 impl PreparedDelete {
+    /// Bind every destructive target and concurrency precondition to the fresh
+    /// source. Serialized identifiers must never independently select a victim.
+    pub fn validate_against_source(&self, source: &[u8]) -> Result<()> {
+        if self.format != "icloud-safari-prepared-delete-v1"
+            || hex::encode(Sha256::digest(source)) != self.source_record_sha256
+        {
+            return Err(Error::Integrity);
+        }
+        let record = Message::parse(source)?;
+        let identifier = STANDARD
+            .decode(&self.record_identifier_base64)
+            .map_err(|_| Error::Fixture("prepared identifier is not valid base64".into()))?;
+        if metadata(self.metadata.dataset, &self.metadata.zone, &record)? != self.metadata
+            || record.values(2).count() != 1
+            || record.first_bytes(2) != Some(identifier.as_slice())
+        {
+            return Err(Error::Integrity);
+        }
+        Ok(())
+    }
+
     /// Encode Apple's `CKDPRecordDeleteRequest` with the fetched etag so the
     /// server can reject a stale delete.
     pub fn encode_record_delete_request(&self) -> Result<Vec<u8>> {
@@ -195,6 +247,9 @@ impl PreparedDelete {
             .decode(&self.record_identifier_base64)
             .map_err(|_| Error::Fixture("prepared identifier is not valid base64".into()))?;
         Message::parse(&identifier)?;
+        if identifier_name(&identifier, true)? != self.metadata.record_name {
+            return Err(Error::Integrity);
+        }
         let mut request = Vec::new();
         wire::encode_bytes(1, &identifier, &mut request);
         wire::encode_string(2, &self.metadata.etag, &mut request);
@@ -945,6 +1000,7 @@ fn metadata(dataset: Dataset, zone: &str, record: &Message) -> Result<RecordMeta
 }
 
 fn encrypted_field(record: &Message, wanted: &str) -> Result<Vec<u8>> {
+    let mut result = None;
     for field in record.values(7) {
         let Value::Bytes(field) = field else { continue };
         let field = Message::parse(field)?;
@@ -954,21 +1010,27 @@ fn encrypted_field(record: &Message, wanted: &str) -> Result<Vec<u8>> {
         if identifier_name(identifier, false)? != wanted {
             continue;
         }
+        if result.is_some() || field.values(1).count() != 1 || field.values(2).count() != 1 {
+            return Err(Error::Integrity);
+        }
         let value = Message::parse(
             field
                 .first_bytes(2)
                 .ok_or(Error::Protobuf("record field omitted value"))?,
         )?;
-        if value.first_varint(13) != Some(1) {
+        if value.first_varint(13) != Some(1)
+            || value.values(13).count() != 1
+            || value.values(2).count() != 1
+        {
             return Err(Error::Unsupported("record field is not encrypted bytes"));
         }
         let blob = value
             .first_bytes(2)
             .ok_or(Error::Protobuf("encrypted field omitted bytes"))?
             .to_vec();
-        return Ok(blob);
+        result = Some(blob);
     }
-    Err(Error::Fixture(format!("field {wanted:?} was not found")))
+    result.ok_or_else(|| Error::Fixture(format!("field {wanted:?} was not found")))
 }
 
 fn replace_encrypted_field(record: &mut Message, wanted: &str, blob: &[u8]) -> Result<()> {

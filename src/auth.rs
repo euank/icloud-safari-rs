@@ -133,14 +133,14 @@ impl SrpClient {
     }
 }
 
-fn modulus() -> BigUint {
+pub(crate) fn modulus() -> BigUint {
     BigUint::parse_bytes(N_HEX.as_bytes(), 16).unwrap()
 }
 fn minimal(value: &BigUint) -> Vec<u8> {
     let bytes = value.to_bytes_be();
     if bytes.is_empty() { vec![0] } else { bytes }
 }
-fn pad(value: &BigUint) -> Vec<u8> {
+pub(crate) fn pad(value: &BigUint) -> Vec<u8> {
     let bytes = minimal(value);
     let mut out = vec![0u8; 256usize.saturating_sub(bytes.len())];
     out.extend(bytes);

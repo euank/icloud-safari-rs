@@ -30,23 +30,9 @@ const SAVE_URL: &str = "https://gateway.icloud.com/ckdatabase/api/client/record/
 #[cfg(feature = "experimental-live-writes")]
 const DELETE_URL: &str = "https://gateway.icloud.com/ckdatabase/api/client/record/delete";
 const CLIENT_INFO: &str = "<MacBookPro18,3> <Mac OS X;13.4.1;22F8> <com.apple.cloudkit.CloudKitDaemon/1970 (com.apple.cloudd/1970)>";
-const DEFAULT_ZONES: &[&str] = &[
-    "Passwords",
-    "Manatee",
-    "Engram",
-    "SecureObjectSync",
-    "ProtectedCloudStorage",
-    "CreditCards",
-    "ApplePay",
-    "WiFi",
-    "Home",
-    "Groups",
-    "Contacts",
-    "Mail",
-    "LimitedPeersAllowed",
-    "SE-PTC",
-    "Photos",
-];
+// Passwords holds current login items; Manatee is the supported legacy view.
+// Unrelated CKKS views are intentionally not prerequisites for password reads.
+const PASSWORD_ZONES: &[&str] = &["Passwords", "Manatee"];
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PasswordEntry {
@@ -104,6 +90,95 @@ pub struct KeychainClient<T, A> {
 }
 
 impl<T: HttpTransport, A: AnisetteProvider> KeychainClient<T, A> {
+    /// Initialize the keychain container for an authenticated account.
+    pub async fn initialize(
+        transport: T,
+        anisette: A,
+        device: DeviceState,
+        mut session: SessionState,
+    ) -> Result<Self> {
+        if session
+            .mme
+            .extra
+            .get("cloudKitUserId")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            let mut headers =
+                common_headers(&anisette, &device, KEYCHAIN_CONTAINER, CUTTLEFISH_BUNDLE).await?;
+            headers.retain(|(name, _)| name != "content-encoding");
+            headers.push((
+                "authorization".into(),
+                format!(
+                    "Basic {}",
+                    STANDARD.encode(format!(
+                        "{}:{}",
+                        session.mme.dsid, session.mme.mme_auth_token
+                    ))
+                ),
+            ));
+            let response = transport.send(HttpRequest {
+                method: "POST".into(),
+                url: format!("https://gateway.icloud.com/setup/setup/ck/v1/ckAppInit?container={KEYCHAIN_CONTAINER}"),
+                headers, body: vec![],
+            }).await?;
+            if response.status / 100 != 2 {
+                return Err(Error::Authentication(
+                    "keychain container initialization failed".into(),
+                ));
+            }
+            let result: serde_json::Value = serde_json::from_slice(&response.body)?;
+            let user = result
+                .get("cloudKitUserId")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or(Error::Protobuf("keychain initialization omitted user ID"))?;
+            session
+                .mme
+                .extra
+                .insert("cloudKitUserId".into(), user.into());
+        }
+        Self::new(transport, anisette, device, session)
+    }
+
+    pub fn session(&self) -> &SessionState {
+        &self.session
+    }
+
+    /// Recover authenticated PCS identity exports for use by the Safari reader.
+    pub async fn recover_pcs_identities(&self) -> Result<Vec<Zeroizing<Vec<u8>>>> {
+        let (tlks, keys) = self.fetch_recoverable_keys().await?;
+        let mut snapshot = self
+            .fetch_zones(&["Manatee", "ProtectedCloudStorage"])
+            .await?;
+        snapshot.records.extend(keys);
+        let items = Archive {
+            records: snapshot.records,
+        }
+        .recover_items(&tlks)?;
+        let mut identities = Vec::new();
+        for item in items {
+            let Some(dict) = item.value.as_dictionary() else {
+                continue;
+            };
+            let Some(data) = dict.get("v_Data").and_then(plist::Value::as_data) else {
+                continue;
+            };
+            if crate::pcs::Identity::from_der(data).is_ok()
+                && !identities
+                    .iter()
+                    .any(|old: &Zeroizing<Vec<u8>>| old.as_slice() == data)
+            {
+                identities.push(Zeroizing::new(data.to_vec()));
+            }
+        }
+        if identities.is_empty() {
+            return Err(Error::Authentication(
+                "no authenticated PCS identities were recovered".into(),
+            ));
+        }
+        Ok(identities)
+    }
     pub fn new(
         transport: T,
         anisette: A,
@@ -131,11 +206,13 @@ impl<T: HttpTransport, A: AnisetteProvider> KeychainClient<T, A> {
         })
     }
 
+    /// Authenticate login items from the Passwords and legacy Manatee views.
+    /// Both views must be retrieved completely; inaccessible views are errors.
     pub async fn fetch_and_decrypt_passwords(
         &self,
     ) -> Result<(KeychainSnapshot, Vec<PasswordEntry>)> {
         let (tlks, recoverable_keys) = self.fetch_recoverable_keys().await?;
-        let mut snapshot = self.fetch_zones(DEFAULT_ZONES).await?;
+        let mut snapshot = self.fetch_zones(PASSWORD_ZONES).await?;
         snapshot.records.extend(recoverable_keys);
         let archive = Archive {
             records: snapshot.records.clone(),
@@ -299,25 +376,22 @@ impl<T: HttpTransport, A: AnisetteProvider> KeychainClient<T, A> {
         })
     }
 
+    /// Fetch every requested zone completely. An unavailable zone or failed
+    /// page is an error, never an empty snapshot or evidence of deletion.
     pub async fn fetch_zones(&self, zones: &[&str]) -> Result<KeychainSnapshot> {
         let mut records = Vec::new();
         let mut fetched = Vec::new();
         for zone in zones {
             let mut continuation = None;
             let mut zone_records = Vec::new();
-            loop {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut complete = false;
+            for _ in 0..1000 {
                 let request =
                     retrieve_changes_request(zone, &self.user_id, continuation.as_deref());
                 let response = self
                     .perform(SYNC_URL, 213, 213, &request, SECURITYD_BUNDLE, None)
-                    .await;
-                let response = match response {
-                    Ok(value) => value,
-                    Err(error) => {
-                        tracing::debug!(zone, %error, "skipping unavailable CKKS zone");
-                        break;
-                    }
-                };
+                    .await?;
                 let page = Message::parse(&response)?;
                 for change in page.values(1) {
                     let WireValue::Bytes(change) = change else {
@@ -329,14 +403,33 @@ impl<T: HttpTransport, A: AnisetteProvider> KeychainClient<T, A> {
                     }
                 }
                 continuation = page.first_bytes(2).map(ToOwned::to_owned);
-                if page.first_varint(4) != Some(1) || continuation.is_none() {
-                    break;
+                match page.first_varint(4) {
+                    Some(3) => {
+                        complete = true;
+                        break;
+                    }
+                    Some(1) => {}
+                    _ => {
+                        return Err(Error::Protobuf(
+                            "unknown CKKS change status; refusing a partial snapshot",
+                        ));
+                    }
+                }
+                let token = continuation
+                    .as_ref()
+                    .filter(|token| !token.is_empty())
+                    .ok_or(Error::Protobuf(
+                        "CKKS pagination omitted its continuation token",
+                    ))?;
+                if !seen.insert(token.clone()) {
+                    return Err(Error::Protobuf("CKKS pagination did not advance"));
                 }
             }
-            if !zone_records.is_empty() {
-                fetched.push((*zone).to_owned());
-                records.extend(zone_records);
+            if !complete {
+                return Err(Error::Protobuf("CKKS pagination exceeded the page limit"));
             }
+            fetched.push((*zone).to_owned());
+            records.extend(zone_records);
         }
         Ok(KeychainSnapshot {
             fetched_at: chrono::Utc::now().to_rfc3339(),
@@ -345,23 +438,14 @@ impl<T: HttpTransport, A: AnisetteProvider> KeychainClient<T, A> {
         })
     }
 
-    async fn fetch_recoverable_keys(
+    pub(crate) async fn fetch_recoverable_keys(
         &self,
     ) -> Result<(BTreeMap<String, Zeroizing<Vec<u8>>>, Vec<Record>)> {
         let octagon =
             self.session.extra.get("octagon").ok_or_else(|| {
                 Error::Authentication("saved session has no Octagon state".into())
             })?;
-        let mut identities = vec![(
-            json_string(octagon, &["peer_id"])?,
-            json_string(octagon, &["keys", "encryption_priv_x963"])?,
-        )];
-        if octagon.get("sponsor").is_some() {
-            identities.push((
-                json_string(octagon, &["sponsor", "peer_id"])?,
-                json_string(octagon, &["sponsor", "encryption_priv_x963"])?,
-            ));
-        }
+        let identities = recovery_identities(octagon)?;
         let mut tlks = BTreeMap::new();
         let mut keys = Vec::new();
         for (peer_id, private_x963) in identities {
@@ -376,12 +460,13 @@ impl<T: HttpTransport, A: AnisetteProvider> KeychainClient<T, A> {
                 keys = recovered_keys.len(),
                 "received recoverable CKKS material"
             );
-            let x963 = hex::decode(private_x963).map_err(|_| Error::Integrity)?;
-            let scalar: [u8; 48] = x963
-                .get(x963.len().saturating_sub(48)..)
-                .ok_or(Error::Integrity)?
-                .try_into()
-                .map_err(|_| Error::Integrity)?;
+            let x963 = Zeroizing::new(hex::decode(private_x963).map_err(|_| Error::Integrity)?);
+            let scalar: Zeroizing<[u8; 48]> = Zeroizing::new(
+                x963.get(x963.len().saturating_sub(48)..)
+                    .ok_or(Error::Integrity)?
+                    .try_into()
+                    .map_err(|_| Error::Integrity)?,
+            );
             for share in shares {
                 if string_field(&share.fields, "receiver") != Some(peer_id) {
                     continue;
@@ -406,7 +491,7 @@ impl<T: HttpTransport, A: AnisetteProvider> KeychainClient<T, A> {
         Ok((tlks, keys))
     }
 
-    async fn invoke(&self, name: &str, parameters: &[u8]) -> Result<Vec<u8>> {
+    pub(crate) async fn invoke(&self, name: &str, parameters: &[u8]) -> Result<Vec<u8>> {
         let mut request = Vec::new();
         wire::encode_string(1, "Cuttlefish", &mut request);
         wire::encode_string(2, name, &mut request);
@@ -500,6 +585,39 @@ impl<T: HttpTransport, A: AnisetteProvider> KeychainClient<T, A> {
             .map(ToOwned::to_owned)
             .ok_or(Error::Protobuf("CloudKit response omitted operation field"))
     }
+}
+
+fn recovery_identities(octagon: &serde_json::Value) -> Result<Vec<(&str, &str)>> {
+    let mut candidates = vec![(
+        json_string(octagon, &["peer_id"])?,
+        json_string(octagon, &["keys", "encryption_priv_x963"])?,
+    )];
+    if octagon.get("sponsor").is_some() {
+        candidates.push((
+            json_string(octagon, &["sponsor", "peer_id"])?,
+            json_string(octagon, &["sponsor", "encryption_priv_x963"])?,
+        ));
+    }
+    if let Some(saved) = octagon.get("recovery_identities") {
+        for identity in saved.as_array().ok_or(Error::Integrity)? {
+            candidates.push((
+                json_string(identity, &["peer_id"])?,
+                json_string(identity, &["encryption_priv_x963"])?,
+            ));
+        }
+    }
+    let mut unique = Vec::new();
+    let mut seen = BTreeMap::new();
+    for (peer, private) in candidates {
+        if let Some(previous) = seen.insert(peer, private) {
+            if previous != private {
+                return Err(Error::Integrity);
+            }
+        } else {
+            unique.push((peer, private));
+        }
+    }
+    Ok(unique)
 }
 
 #[cfg(feature = "experimental-live-writes")]
@@ -1198,5 +1316,220 @@ mod tests {
         assert_eq!(entries[0].password, value.password);
         assert_eq!(entries[0].title, value.title.unwrap());
         assert!(!format!("{:?}", entries[0]).contains(value.password));
+    }
+}
+
+#[cfg(test)]
+mod fetch_tests {
+    use super::*;
+    use crate::cloudkit::HttpResponse;
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
+
+    #[test]
+    fn recovery_candidates_include_fallbacks_without_duplicate_requests() {
+        let mut octagon = serde_json::json!({
+            "peer_id": "new", "keys": {"encryption_priv_x963": "key-new"},
+            "sponsor": {"peer_id": "sponsor", "encryption_priv_x963": "key-sponsor"},
+            "recovery_identities": [
+                {"peer_id": "original", "encryption_priv_x963": "key-original"},
+                {"peer_id": "original", "encryption_priv_x963": "key-original"},
+                {"peer_id": "sponsor", "encryption_priv_x963": "key-sponsor"}
+            ]
+        });
+        assert_eq!(
+            recovery_identities(&octagon).unwrap(),
+            vec![
+                ("new", "key-new"),
+                ("sponsor", "key-sponsor"),
+                ("original", "key-original")
+            ]
+        );
+        octagon["recovery_identities"][1]["encryption_priv_x963"] = "different-key".into();
+        assert!(recovery_identities(&octagon).is_err());
+        octagon["recovery_identities"] = serde_json::Value::Null;
+        assert!(recovery_identities(&octagon).is_err());
+    }
+
+    struct Reply {
+        field: u32,
+        status: u16,
+        payload: Vec<u8>,
+    }
+    #[derive(Clone)]
+    struct Script(Arc<Mutex<VecDeque<Reply>>>);
+    #[async_trait::async_trait]
+    impl HttpTransport for Script {
+        async fn send(&self, request: HttpRequest) -> Result<HttpResponse> {
+            let reply = self
+                .0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected request");
+            let expected_path = if reply.field == 214 {
+                "/delete"
+            } else {
+                "/sync"
+            };
+            assert!(request.url.ends_with(expected_path));
+            let mut operation = Vec::new();
+            wire::encode_bytes(reply.field, &reply.payload, &mut operation);
+            let mut body = Vec::new();
+            wire::encode_varint(operation.len() as u64, &mut body);
+            body.extend(operation);
+            Ok(HttpResponse {
+                status: reply.status,
+                headers: vec![],
+                body,
+            })
+        }
+    }
+    struct Anisette;
+    #[async_trait::async_trait]
+    impl AnisetteProvider for Anisette {
+        async fn headers(&self) -> Result<BTreeMap<String, String>> {
+            Ok(BTreeMap::from([
+                ("X-Apple-I-MD".into(), "synthetic".into()),
+                ("X-Apple-I-MD-M".into(), "synthetic".into()),
+            ]))
+        }
+    }
+    fn client(replies: Vec<Reply>) -> (KeychainClient<Script, Anisette>, Script) {
+        let script = Script(Arc::new(Mutex::new(replies.into())));
+        let session = serde_json::from_value(serde_json::json!({
+            "username": "test@example.invalid", "dsid": "123",
+            "mme": {"dsid": "123", "mmeAuthToken": "synthetic", "tokens": {"cloudKitToken": "synthetic"}, "cloudKitUserId": "synthetic"}
+        })).unwrap();
+        (
+            KeychainClient::new(script.clone(), Anisette, DeviceState::generate(), session)
+                .unwrap(),
+            script,
+        )
+    }
+    fn page(more: bool, token: Option<&[u8]>, record: bool) -> Reply {
+        let mut payload = Vec::new();
+        if record {
+            let mut record_id = Vec::new();
+            wire::encode_bytes(1, &identifier("test-record", 1), &mut record_id);
+            let mut raw = Vec::new();
+            wire::encode_string(1, "etag", &mut raw);
+            wire::encode_bytes(2, &record_id, &mut raw);
+            wire::encode_bytes(3, &identifier("item", 1), &mut raw);
+            let mut change = Vec::new();
+            wire::encode_bytes(5, &raw, &mut change);
+            wire::encode_bytes(1, &change, &mut payload);
+        }
+        if let Some(token) = token {
+            wire::encode_bytes(2, token, &mut payload);
+        }
+        wire::encode_uint(4, if more { 1 } else { 3 }, &mut payload);
+        Reply {
+            field: 213,
+            status: 200,
+            payload,
+        }
+    }
+    fn failure() -> Reply {
+        Reply {
+            field: 213,
+            status: 503,
+            payload: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_empty_zone_is_reported_as_fetched() {
+        let (client, script) = client(vec![page(false, None, false)]);
+        let snapshot = client.fetch_zones(&["Passwords"]).await.unwrap();
+        assert_eq!(snapshot.zones, vec!["Passwords"]);
+        assert!(snapshot.records.is_empty());
+        assert!(script.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn zone_and_later_page_failures_never_return_partial_snapshots() {
+        for replies in [
+            vec![failure()],
+            vec![page(true, Some(b"next"), true), failure()],
+        ] {
+            let (client, script) = client(replies);
+            assert!(client.fetch_zones(&["Passwords"]).await.is_err());
+            assert!(script.0.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn continuation_must_exist_and_advance() {
+        for replies in [
+            vec![page(true, None, false)],
+            vec![page(true, Some(b""), false)],
+            vec![
+                page(true, Some(b"same"), false),
+                page(true, Some(b"same"), false),
+            ],
+        ] {
+            let (client, script) = client(replies);
+            assert!(client.fetch_zones(&["Passwords"]).await.is_err());
+            assert!(script.0.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_or_missing_final_status_never_completes_a_zone() {
+        for status in [None, Some(0), Some(2), Some(4), Some(u64::MAX)] {
+            let mut payload = Vec::new();
+            if let Some(status) = status {
+                wire::encode_uint(4, status, &mut payload);
+            }
+            let (client, script) = client(vec![
+                page(true, Some(b"next"), true),
+                Reply {
+                    field: 213,
+                    status: 200,
+                    payload,
+                },
+            ]);
+            assert!(client.fetch_zones(&["Passwords"]).await.is_err());
+            assert!(script.0.lock().unwrap().is_empty());
+        }
+    }
+
+    #[cfg(feature = "experimental-live-writes")]
+    #[tokio::test]
+    async fn malformed_post_delete_status_is_not_confirmed_absence() {
+        let (client, script) = client(vec![
+            page(false, None, true),
+            Reply {
+                field: 214,
+                status: 200,
+                payload: vec![],
+            },
+            Reply {
+                field: 213,
+                status: 200,
+                payload: vec![],
+            },
+        ]);
+        assert!(client.delete_password("test-record").await.is_err());
+        assert!(script.0.lock().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "experimental-live-writes")]
+    #[tokio::test]
+    async fn failed_post_delete_fetch_is_not_confirmed_absence() {
+        let (client, script) = client(vec![
+            page(false, None, true),
+            Reply {
+                field: 214,
+                status: 200,
+                payload: vec![],
+            },
+            failure(),
+        ]);
+        assert!(client.delete_password("test-record").await.is_err());
+        assert!(script.0.lock().unwrap().is_empty());
     }
 }

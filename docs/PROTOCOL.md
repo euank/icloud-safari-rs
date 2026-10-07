@@ -1067,8 +1067,9 @@ Call Cuttlefish `fetchViableBottles` with parameters:
 FetchViableBottlesRequest { 1:uint64 1, 2:bytes empty }
 ```
 
-The result repeats field 1 escrow records. Within each, field 1 is the bottle
-ID; field 2 is a bottle message whose field 2 is `OTBottle` bytes. The
+The result repeats field 1 escrow records. Within each, field 1 is the escrow
+record label (not the bottle UUID); field 2 is a bottle message whose field 2
+is `OTBottle` bytes. The bottle UUID is OTBottle field 2. The
 KeychainSync escrow service's non-destructive `GETRECORDS` operation can add
 human-readable device metadata.
 
@@ -1091,7 +1092,7 @@ The body is an XML plist:
 ```text
 {
   "command": "GETRECORDS" | "SRP_INIT" | "RECOVER",
-  "label": bottleID,
+  "label": escrowRecordLabel,
   "transactionUUID": uppercaseUUID,
   "userActionLabel": "com.apple.sbd: escrow recovery",
   "version": 1,
@@ -1122,13 +1123,22 @@ equal to the escrow secret:
 ```text
 k  = INT(SHA256(PAD(N) ‖ PAD(g)))
 x  = INT(SHA256(salt ‖ SHA256(username ‖ ":" ‖ password)))
-u  = INT(SHA256(MIN(A) ‖ MIN(B)))
+u  = INT(SHA256(PAD(A) ‖ PAD(B)))
 S  = (B - k*g^x mod N)^(a + u*x) mod N
 K  = SHA256(MIN(S))
 M1 = SHA256((SHA256(PAD(N)) XOR SHA256(PAD(g))) ‖ SHA256(username)
             ‖ salt ‖ MIN(A) ‖ MIN(B) ‖ K)
 M2 = SHA256(MIN(A) ‖ M1 ‖ K)
 ```
+
+The scrambling parameter uses 256-byte-padded public values, unlike the
+minimal encodings in the proofs and session-key hash. This was checked offline
+against [pysrp's primary implementation](https://github.com/cocagne/pysrp/blob/master/srp/_pysrp.py)
+version 1.0.22 with RFC5054 mode enabled (as FindMy's account bootstrap does)
+and username inclusion restored for escrow. The independent server calculations
+in `tests/generate_enrollment_vectors.py --verify-pysrp` cover six exchanges,
+including short public values that distinguish the encodings. This correction
+does not establish the cause of any observed live HTTP 409 recovery failure.
 
 For `RECOVER`, copy the initialization header, replace bytes 0:4 with BE32(165)
 and bytes 4:8 with BE32(2 when `clubTypeID == 1`, otherwise 0). Pack the
@@ -1188,7 +1198,10 @@ OTPrivateKey { 1:uint64 keyType, 2:bytes privateX963 }
 ```
 
 Field 3 is the sponsor signing key and field 4 the sponsor encryption key.
-Verify their public keys against OTBottle fields 8 and 9 before using them.
+Verify their public keys against the authenticated sponsor's permanent-info
+keys in the trust directory (and the corresponding OTBottle peer public keys).
+OTBottle fields 8 and 9 are the independently derived **escrow** keys, not the
+decrypted sponsor keys; conflating them rejects a valid recovered bottle.
 The working read path uses those stored private keys. For implementations that
 need to derive/check the escrowed keys independently, use HKDF-SHA384 with the
 same entropy and ADSID salt, `L=56`, and info strings `Escrow Signing Private

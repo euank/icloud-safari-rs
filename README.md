@@ -11,6 +11,8 @@ cargo run -- export --output safari.json
 
 List and export commands fetch current iCloud data by default. Pass `--offline`
 to use the local cache; selecting `--fixture-dir` is also implicitly offline.
+`--fixture-dir` is rejected by live-only commands, including passwords and
+mutations. Password reads are currently online-only.
 
 ## Login and local state
 
@@ -25,16 +27,45 @@ Re-running `login` defaults to the saved account and preserves its encryption
 enrollment and service identifiers. Failed authentication leaves the saved
 session intact. Use a separate `--state-dir PATH` for each Apple Account;
 login refuses to replace a saved session with a different account's DSID.
+Commands that update state take a process lock; a second command fails clearly
+instead of racing token refresh or enrollment. Automation can use
+`login --password-file PATH` with an owner-only regular file; passwords are
+never accepted as command-line values.
 
 Online commands refresh saved tokens before operating; `cargo run -- refresh`
 does so explicitly. There is no background refresh process after a command exits.
 
 ### Encryption-key setup
 
-Login authenticates the account but does **not** yet enroll a new device in
-iCloud Keychain or recover Safari encryption keys. A fresh login therefore
-cannot by itself decrypt Safari data or passwords. The `escrow`, `octagon`,
-and `keys` commands remain unimplemented.
+Login authenticates the account; enrollment is a separate, experimental step.
+A fresh login cannot by itself decrypt Safari data or passwords.
+
+```console
+cargo run -- escrow list
+cargo run -- octagon enroll --bottle-id UUID --confirm-escrow-recovery UUID
+cargo run -- keys recover
+```
+
+Use a bottle UUID returned by `escrow list`. Enrollment authenticates again
+(add `--sms` if needed), then asks for the passcode of the Apple device that
+created that escrow record—not the Apple Account password. Recovery attempts
+are rate-limited by Apple: do not guess passcodes. Enrollment requires an
+existing viable bottle and trust circle; it cannot establish or reset one.
+It adds a trusted peer and automatically recovers PCS identities. It requires
+the default `experimental-live-writes` feature.
+
+Recovered material and the signed peer are saved before joining. Repeat the same
+command to resume a saved recovery or pending enrollment without another
+passcode attempt. A failed/uncertain recovery blocks repeats unless explicitly
+authorized with `--retry-escrow-recovery`; do not use that flag speculatively.
+Use `--refresh-trust` to re-sign a stale pending peer without changing its identity.
+`keys recover`
+can be repeated independently with existing enrollment. Keep the entire private
+state directory, including `enrollment/pending.json`; it contains private keys.
+New-peer joining, resume, and key recovery are live-tested with an existing
+trusted peer. Fresh passcode recovery is **not yet working end to end**: the
+test account returned HTTP 409 on its one attempted recovery. See
+[enrollment details](docs/ENROLLMENT.md) and [validation status](docs/VALIDATION.md).
 
 Existing setups need their own `pcs-identities/*.der` files for Safari, and
 saved Octagon enrollment plus the keychain CloudKit user ID for passwords.

@@ -1,8 +1,13 @@
 # Safari iCloud write protocol: current evidence and capture contract
 
-Last updated: 2026-09-05
+Last updated: 2026-09-06
 
 ## Status
+
+The current replacement PCS encoder and hardened readback checks passed a
+fresh disposable production CRUD test on 2026-09-06 for both bookmarks and
+tabs. Exact decrypted title/URL and independent deletion checks passed.
+See `tests/live_crud.rs` and [validation status](VALIDATION.md).
 
 This is a write-path research specification, not an authorization to mutate an
 account. It distinguishes byte-level facts from hypotheses so an implementation

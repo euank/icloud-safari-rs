@@ -71,6 +71,10 @@ impl Default for ReqwestTransport {
             .expect("embedded Apple Root CA must be valid PEM");
         let client = reqwest::Client::builder()
             .add_root_certificate(apple_root)
+            .connect_timeout(std::time::Duration::from_secs(20))
+            .timeout(std::time::Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .expect("default reqwest client must build");
         Self { client }
@@ -89,7 +93,7 @@ impl HttpTransport for ReqwestTransport {
             .body(request.body)
             .send()
             .await
-            .map_err(|e| Error::Network(e.to_string()))?;
+            .map_err(|e| Error::Network(e.without_url().to_string()))?;
         let status = response.status().as_u16();
         let headers = response
             .headers()
@@ -99,7 +103,7 @@ impl HttpTransport for ReqwestTransport {
         let body = response
             .bytes()
             .await
-            .map_err(|e| Error::Network(e.to_string()))?
+            .map_err(|e| Error::Network(e.without_url().to_string()))?
             .to_vec();
         Ok(HttpResponse {
             status,
@@ -254,7 +258,14 @@ impl<T: HttpTransport, A: AnisetteProvider> Client<T, A> {
             .clone();
         let mut pages = Vec::new();
         let mut continuation = None;
+        let mut seen_continuations = std::collections::BTreeSet::new();
         loop {
+            if pages.len() >= 1000 {
+                return Err(Error::Network(
+                    "CloudKit change pagination exceeded 1000 pages; refusing a partial snapshot"
+                        .into(),
+                ));
+            }
             let operation = record_changes_operation(
                 &self.device,
                 container,
@@ -299,9 +310,26 @@ impl<T: HttpTransport, A: AnisetteProvider> Client<T, A> {
                 .find_map(|m| m.first_bytes(213))
                 .ok_or(Error::Protobuf("missing record-change response"))?;
             let parsed = parse_changes(specific)?;
+            let done = match parsed.0.status {
+                1 => {
+                    let token = parsed.1.as_ref().filter(|token| !token.is_empty()).ok_or(
+                        Error::Protobuf("continuing record changes omitted continuation token"),
+                    )?;
+                    if !seen_continuations.insert(token.clone()) {
+                        return Err(Error::Protobuf("record-change continuation token repeated"));
+                    }
+                    false
+                }
+                3 => true,
+                _ => {
+                    return Err(Error::Protobuf(
+                        "unknown record-change status; refusing a partial snapshot",
+                    ));
+                }
+            };
             continuation = parsed.1.clone();
             pages.push(parsed.0);
-            if pages.last().unwrap().status != 1 || continuation.is_none() {
+            if done {
                 break;
             }
         }
@@ -328,6 +356,9 @@ impl<T: HttpTransport, A: AnisetteProvider> Client<T, A> {
             ));
         }
         let fresh = self.fetch(plan.metadata.dataset).await?;
+        if fresh.zone != plan.metadata.zone {
+            return Err(Error::Integrity);
+        }
         let source = fetched_record_bytes(&fresh, &plan.metadata.record_name)?;
         if hex::encode(Sha256::digest(&source)) != plan.original_record_sha256 {
             return Err(Error::Fixture(
@@ -339,10 +370,7 @@ impl<T: HttpTransport, A: AnisetteProvider> Client<T, A> {
         self.send_mutation(plan.metadata.dataset, 210, &request, 210)
             .await?;
         let after = self.fetch(plan.metadata.dataset).await?;
-        let current = Message::parse(&fetched_record_bytes(&after, &plan.metadata.record_name)?)?;
-        if current.first_bytes(1) == Some(plan.metadata.etag.as_bytes()) {
-            return Err(Error::Integrity);
-        }
+        plan.validate_applied_record(&fetched_record_bytes(&after, &plan.metadata.record_name)?)?;
         Ok(after)
     }
 
@@ -359,12 +387,16 @@ impl<T: HttpTransport, A: AnisetteProvider> Client<T, A> {
             ));
         }
         let fresh = self.fetch(plan.metadata.dataset).await?;
+        if fresh.zone != plan.metadata.zone {
+            return Err(Error::Integrity);
+        }
         let source = fetched_record_bytes(&fresh, &plan.metadata.record_name)?;
         if hex::encode(Sha256::digest(&source)) != plan.source_record_sha256 {
             return Err(Error::Fixture(
                 "record changed after the delete was prepared; prepare it again".into(),
             ));
         }
+        plan.validate_against_source(&source)?;
         let request = plan.encode_record_delete_request()?;
         self.send_mutation(plan.metadata.dataset, 214, &request, 214)
             .await?;
@@ -828,9 +860,371 @@ fn parse_value(bytes: &[u8]) -> Result<serde_json::Value> {
     Ok(serde_json::json!({"type":"bytes","base64":STANDARD.encode(bytes)}))
 }
 
+#[cfg(test)]
+mod fetch_tests {
+    use super::*;
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Clone)]
+    struct Script(Arc<Mutex<VecDeque<HttpResponse>>>);
+    #[async_trait]
+    impl HttpTransport for Script {
+        async fn send(&self, request: HttpRequest) -> Result<HttpResponse> {
+            assert!(request.url.ends_with("/sync"));
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected page request"))
+        }
+    }
+    struct Anisette;
+    #[async_trait]
+    impl AnisetteProvider for Anisette {
+        async fn headers(&self) -> Result<BTreeMap<String, String>> {
+            Ok(BTreeMap::from([
+                ("X-Apple-I-MD".into(), "synthetic".into()),
+                ("X-Apple-I-MD-M".into(), "synthetic".into()),
+            ]))
+        }
+    }
+    fn client(replies: Vec<HttpResponse>) -> (Client<Script, Anisette>, Script) {
+        let script = Script(Arc::new(Mutex::new(replies.into())));
+        let session: SessionState = serde_json::from_value(serde_json::json!({
+            "username": "test@example.invalid", "dsid": "123",
+            "mme": {"dsid": "123", "mmeAuthToken": "synthetic", "tokens": {"cloudKitToken": "synthetic"}},
+            "safari_cloudkit_users": {"com.apple.SafariShared.WBSCloudBookmarksStore": "synthetic-user"}
+        })).unwrap();
+        (
+            Client::new(script.clone(), Anisette, DeviceState::generate(), session),
+            script,
+        )
+    }
+    fn page(status: u64, token: Option<&[u8]>) -> HttpResponse {
+        let mut changes = Vec::new();
+        if let Some(token) = token {
+            wire::encode_bytes(2, token, &mut changes);
+        }
+        wire::encode_uint(4, status, &mut changes);
+        let mut response = Vec::new();
+        wire::encode_bytes(213, &changes, &mut response);
+        let mut body = Vec::new();
+        wire::encode_varint(response.len() as u64, &mut body);
+        body.extend(response);
+        HttpResponse {
+            status: 200,
+            headers: vec![],
+            body,
+        }
+    }
+
+    #[tokio::test]
+    async fn only_explicit_final_page_completes_a_snapshot() {
+        let (mut client, script) = client(vec![page(1, Some(b"next")), page(3, None)]);
+        let snapshot = client.fetch(Dataset::Bookmarks).await.unwrap();
+        assert_eq!(snapshot.pages.len(), 2);
+        assert_eq!(snapshot.pages[1].status, 3);
+        assert!(snapshot.pages.iter().all(|page| page.records.is_empty()));
+        assert!(script.0.lock().unwrap().is_empty());
+        let (mut client, _) = self::client(vec![page(3, None)]);
+        assert_eq!(
+            client.fetch(Dataset::Bookmarks).await.unwrap().pages.len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_empty_and_repeated_continuations_fail_closed() {
+        for replies in [
+            vec![page(1, None)],
+            vec![page(1, Some(b""))],
+            vec![page(1, Some(b"next")), page(1, Some(b"next"))],
+            vec![
+                page(1, Some(b"one")),
+                page(1, Some(b"two")),
+                page(1, Some(b"one")),
+            ],
+        ] {
+            let (mut client, script) = client(replies);
+            assert!(client.fetch(Dataset::Bookmarks).await.is_err());
+            assert!(script.0.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_status_and_later_page_failure_never_return_partial_success() {
+        for status in [0, 2, 4, u64::MAX] {
+            let (mut client, _) = client(vec![page(1, Some(b"next")), page(status, None)]);
+            assert!(client.fetch(Dataset::Bookmarks).await.is_err());
+        }
+        let (mut client, _) = client(vec![
+            page(1, Some(b"next")),
+            HttpResponse {
+                status: 503,
+                headers: vec![],
+                body: vec![],
+            },
+        ]);
+        assert!(client.fetch(Dataset::Bookmarks).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unique_continuations_are_still_bounded() {
+        let replies = (0..1001)
+            .map(|index| page(1, Some(index.to_string().as_bytes())))
+            .collect();
+        let (mut client, script) = client(replies);
+        assert!(client.fetch(Dataset::Bookmarks).await.is_err());
+        assert_eq!(script.0.lock().unwrap().len(), 1);
+    }
+}
+
 #[cfg(all(test, feature = "experimental-live-writes"))]
 mod write_tests {
     use super::*;
+    use crate::write::{AadMode, PlaintextCodec, RecordMetadata};
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
+
+    type Replies = VecDeque<(&'static str, Vec<u8>)>;
+    #[derive(Clone)]
+    struct Script(Arc<Mutex<Replies>>);
+    #[async_trait]
+    impl HttpTransport for Script {
+        async fn send(&self, request: HttpRequest) -> Result<HttpResponse> {
+            let (route, body) = self
+                .0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected mutation or retry");
+            assert!(request.url.ends_with(route));
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![],
+                body,
+            })
+        }
+    }
+    struct Anisette;
+    #[async_trait]
+    impl AnisetteProvider for Anisette {
+        async fn headers(&self) -> Result<BTreeMap<String, String>> {
+            Ok(BTreeMap::from([
+                ("X-Apple-I-MD".into(), "synthetic".into()),
+                ("X-Apple-I-MD-M".into(), "synthetic".into()),
+            ]))
+        }
+    }
+    fn client(script: Script) -> Client<Script, Anisette> {
+        let session: SessionState = serde_json::from_value(serde_json::json!({
+            "username": "test@example.invalid", "dsid": "123",
+            "mme": {"dsid": "123", "mmeAuthToken": "synthetic", "tokens": {"cloudKitToken": "synthetic"}},
+            "safari_cloudkit_users": {"com.apple.SafariShared.WBSCloudBookmarksStore": "synthetic-user"}
+        })).unwrap();
+        Client::new(script, Anisette, DeviceState::generate(), session)
+    }
+    fn synthetic_record(name: &str, etag: &str, ciphertext: &[u8]) -> Vec<u8> {
+        let mut record_id = Vec::new();
+        wire::encode_bytes(1, &identifier(name, 1), &mut record_id);
+        let mut value = Vec::new();
+        wire::encode_bytes(2, ciphertext, &mut value);
+        wire::encode_uint(13, 1, &mut value);
+        let mut field = Vec::new();
+        wire::encode_bytes(1, &identifier("Title", 1), &mut field);
+        wire::encode_bytes(2, &value, &mut field);
+        let mut protection = Vec::new();
+        wire::encode_string(2, "protection-tag", &mut protection);
+        let mut record = Vec::new();
+        wire::encode_string(1, etag, &mut record);
+        wire::encode_bytes(2, &record_id, &mut record);
+        wire::encode_bytes(3, &identifier("Bookmark", 1), &mut record);
+        wire::encode_bytes(7, &field, &mut record);
+        wire::encode_bytes(13, &protection, &mut record);
+        // Unknown fields must survive preparation and remain accepted in readback.
+        wire::encode_bytes(100, b"opaque future metadata", &mut record);
+        record
+    }
+    fn record_metadata() -> RecordMetadata {
+        RecordMetadata {
+            dataset: Dataset::Bookmarks,
+            zone: "Bookmarks".into(),
+            record_name: "confirmed-record".into(),
+            record_type: "Bookmark".into(),
+            etag: "old-etag".into(),
+            protection_info_tag: "protection-tag".into(),
+        }
+    }
+    fn update_plan(source: &[u8]) -> PreparedFieldUpdate {
+        let updated = synthetic_record("confirmed-record", "old-etag", b"new ciphertext");
+        PreparedFieldUpdate {
+            format: "icloud-safari-prepared-field-update-v1".into(),
+            metadata: record_metadata(),
+            field_name: "Title".into(),
+            plaintext_codec: PlaintextCodec::Utf8,
+            aad_mode: AadMode::RecordContext,
+            original_record_sha256: hex::encode(Sha256::digest(source)),
+            updated_record_sha256: hex::encode(Sha256::digest(&updated)),
+            plaintext_sha256: "synthetic".into(),
+            updated_record_base64: STANDARD.encode(updated),
+        }
+    }
+    fn fetch_response(record: Option<&[u8]>) -> Vec<u8> {
+        let mut changes = Vec::new();
+        if let Some(record) = record {
+            let mut change = Vec::new();
+            wire::encode_bytes(5, record, &mut change);
+            wire::encode_bytes(1, &change, &mut changes);
+        }
+        wire::encode_uint(4, 3, &mut changes);
+        let mut response = Vec::new();
+        wire::encode_bytes(213, &changes, &mut response);
+        let mut framed = Vec::new();
+        wire::encode_varint(response.len() as u64, &mut framed);
+        framed.extend(response);
+        framed
+    }
+    fn mutation_success(field: u32) -> Vec<u8> {
+        let mut result = Vec::new();
+        wire::encode_uint(1, 1, &mut result);
+        let mut response = Vec::new();
+        wire::encode_bytes(3, &result, &mut response);
+        wire::encode_bytes(field, &[], &mut response);
+        let mut framed = Vec::new();
+        wire::encode_varint(response.len() as u64, &mut framed);
+        framed.extend(response);
+        framed
+    }
+
+    #[tokio::test]
+    async fn changed_etag_with_unchanged_ciphertext_is_not_a_successful_update() {
+        let source = synthetic_record("confirmed-record", "old-etag", b"old ciphertext");
+        let plan = update_plan(&source);
+        for (ciphertext, succeeds) in [
+            (b"old ciphertext".as_slice(), false),
+            (b"new ciphertext".as_slice(), true),
+        ] {
+            let after = synthetic_record("confirmed-record", "new-etag", ciphertext);
+            let script = Script(Arc::new(Mutex::new(VecDeque::from([
+                ("/sync", fetch_response(Some(&source))),
+                ("/save", mutation_success(210)),
+                ("/sync", fetch_response(Some(&after))),
+            ]))));
+            let result = client(script.clone())
+                .apply_prepared_update(&plan, "confirmed-record")
+                .await;
+            assert_eq!(result.is_ok(), succeeds);
+            assert!(script.0.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn edited_delete_identifier_or_metadata_is_rejected_before_mutation() {
+        let source = synthetic_record("confirmed-record", "old-etag", b"old ciphertext");
+        let identifier = Message::parse(&source)
+            .unwrap()
+            .first_bytes(2)
+            .unwrap()
+            .to_vec();
+        let plan = PreparedDelete {
+            format: "icloud-safari-prepared-delete-v1".into(),
+            metadata: record_metadata(),
+            record_identifier_base64: STANDARD.encode(identifier),
+            source_record_sha256: hex::encode(Sha256::digest(&source)),
+        };
+        let mut other_target = plan.clone();
+        let other = synthetic_record("unconfirmed-victim", "old-etag", b"old ciphertext");
+        other_target.record_identifier_base64 =
+            STANDARD.encode(Message::parse(&other).unwrap().first_bytes(2).unwrap());
+        assert!(other_target.encode_record_delete_request().is_err());
+        let mut other_identifier_context = plan.clone();
+        let mut edited_identifier = STANDARD.decode(&plan.record_identifier_base64).unwrap();
+        wire::encode_bytes(2, b"different zone context", &mut edited_identifier);
+        other_identifier_context.record_identifier_base64 = STANDARD.encode(edited_identifier);
+        // Matching visible names alone cannot authorize a different identifier.
+        assert!(
+            other_identifier_context
+                .encode_record_delete_request()
+                .is_ok()
+        );
+        let mut other_etag = plan.clone();
+        other_etag.metadata.etag = "forged-etag".into();
+        let mut other_type = plan.clone();
+        other_type.metadata.record_type = "OtherType".into();
+        let mut other_zone = plan.clone();
+        other_zone.metadata.zone = "OtherZone".into();
+        for edited in [
+            other_target,
+            other_identifier_context,
+            other_etag,
+            other_type,
+            other_zone,
+        ] {
+            let script = Script(Arc::new(Mutex::new(VecDeque::from([(
+                "/sync",
+                fetch_response(Some(&source)),
+            )]))));
+            assert!(
+                client(script.clone())
+                    .apply_prepared_delete(&edited, "confirmed-record")
+                    .await
+                    .is_err()
+            );
+            assert!(script.0.lock().unwrap().is_empty());
+        }
+        let script = Script(Arc::new(Mutex::new(VecDeque::from([
+            ("/sync", fetch_response(Some(&source))),
+            ("/delete", mutation_success(214)),
+            ("/sync", fetch_response(None)),
+        ]))));
+        assert!(
+            client(script.clone())
+                .apply_prepared_delete(&plan, "confirmed-record")
+                .await
+                .is_ok()
+        );
+        assert!(script.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn readback_rejects_wrong_field_duplicate_field_and_wrong_record_identity() {
+        let source = synthetic_record("confirmed-record", "old-etag", b"old ciphertext");
+        let plan = update_plan(&source);
+        let valid = synthetic_record("confirmed-record", "new-etag", b"new ciphertext");
+        assert!(plan.validate_applied_record(&valid).is_ok());
+        assert!(
+            plan.validate_applied_record(&synthetic_record(
+                "other-record",
+                "new-etag",
+                b"new ciphertext"
+            ))
+            .is_err()
+        );
+        assert!(
+            plan.validate_applied_record(&synthetic_record(
+                "confirmed-record",
+                "",
+                b"new ciphertext"
+            ))
+            .is_err()
+        );
+        let mut duplicate = valid.clone();
+        wire::encode_bytes(
+            7,
+            Message::parse(&valid).unwrap().first_bytes(7).unwrap(),
+            &mut duplicate,
+        );
+        assert!(plan.validate_applied_record(&duplicate).is_err());
+        let mut wrong_field_plan = plan;
+        wrong_field_plan.field_name = "OtherField".into();
+        assert!(wrong_field_plan.validate_applied_record(&valid).is_err());
+    }
 
     #[test]
     fn wraps_mutations_in_the_generated_operation_slot() {
@@ -846,5 +1240,103 @@ mod write_tests {
         assert_eq!(operation.first_varint(2), Some(210));
         assert_eq!(operation.first_varint(4), Some(1));
         assert_eq!(request.first_bytes(210), Some(b"save".as_slice()));
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    #[tokio::test]
+    async fn redirects_never_forward_sensitive_headers_or_request_bodies() {
+        let origin = MockServer::start().await;
+        let destination = MockServer::start().await;
+        Mock::given(path("/sink"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&destination)
+            .await;
+        let transport = ReqwestTransport::default();
+        for status in [301, 302, 303, 307, 308] {
+            let route = format!("/redirect-{status}");
+            Mock::given(method("POST"))
+                .and(path(&route))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("Location", format!("{}/sink", destination.uri())),
+                )
+                .expect(1)
+                .mount(&origin)
+                .await;
+            let response = transport
+                .send(HttpRequest {
+                    method: "POST".into(),
+                    url: format!("{}{route}", origin.uri()),
+                    headers: vec![
+                        (
+                            "Authorization".into(),
+                            "Basic synthetic-private-token".into(),
+                        ),
+                        ("X-Apple-I-MD".into(), "synthetic-private-anisette".into()),
+                        ("X-Apple-I-MD-M".into(), "synthetic-private-machine".into()),
+                    ],
+                    body: b"synthetic-private-body".to_vec(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(response.status, status);
+        }
+        let received = origin.received_requests().await.unwrap();
+        assert_eq!(received.len(), 5);
+        for request in received {
+            assert_eq!(
+                request.headers["Authorization"],
+                "Basic synthetic-private-token"
+            );
+            assert_eq!(
+                request.headers["X-Apple-I-MD"],
+                "synthetic-private-anisette"
+            );
+            assert_eq!(request.body, b"synthetic-private-body");
+        }
+        assert!(destination.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn connection_errors_redact_query_credentials() {
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/recovery?token=synthetic-query-secret&password=synthetic-password",
+            server.local_addr().unwrap()
+        );
+        // Dropping this raw listener closes its socket (wiremock pools theirs). No external
+        // network or account state is involved in this connection failure.
+        drop(server);
+        let error = ReqwestTransport::default()
+            .send(HttpRequest {
+                method: "POST".into(),
+                url: url.clone(),
+                headers: vec![(
+                    "Authorization".into(),
+                    "Basic synthetic-header-secret".into(),
+                )],
+                body: vec![],
+            })
+            .await
+            .unwrap_err();
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            for secret in [
+                &url,
+                "synthetic-query-secret",
+                "synthetic-password",
+                "synthetic-header-secret",
+            ] {
+                assert!(!rendered.contains(secret));
+            }
+        }
     }
 }
