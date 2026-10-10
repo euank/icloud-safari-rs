@@ -74,7 +74,8 @@ Subsequent live tests on 2026-09-06 confirmed:
 Fresh escrow recovery remains blocked: the one `RECOVER` attempt using the
 documented device-secret version returned HTTP 409. Its body was not retained,
 so the numeric server status is unknown. Error handling now reports numeric
-status without exposing response blobs or messages. A padded-SRP-public-value
+status and a single bounded line of the server's rejection message (which
+can name account details) without exposing response blobs. A padded-SRP-public-value
 edge case was found and fixed independently; it does not establish the cause
 of the rejection. No automatic retry was made.
 

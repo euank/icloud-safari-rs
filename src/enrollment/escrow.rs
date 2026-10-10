@@ -184,15 +184,19 @@ impl<'a, T: HttpTransport, A: AnisetteProvider> EscrowClient<'a, T, A> {
             })
             .await?;
         if response.status / 100 != 2 {
-            let status = plist::Value::from_reader(std::io::Cursor::new(&response.body))
-                .ok()
-                .and_then(|value| rejection_status(&value));
+            let value = plist::Value::from_reader(std::io::Cursor::new(&response.body)).ok();
+            let status = value.as_ref().and_then(rejection_status);
             return Err(Error::Authentication(format!(
-                "escrow {command} failed (HTTP {}, server status {}); no retry was attempted",
+                "escrow {command} failed (HTTP {}, server status {}{}); no retry was attempted",
                 response.status,
                 status
                     .map(|n| n.to_string())
-                    .unwrap_or_else(|| "unavailable".into())
+                    .unwrap_or_else(|| "unavailable".into()),
+                value
+                    .as_ref()
+                    .and_then(rejection_message)
+                    .map(|message| format!(": {message}"))
+                    .unwrap_or_default()
             )));
         }
         let value = plist::Value::from_reader(std::io::Cursor::new(response.body))?;
@@ -204,7 +208,10 @@ impl<'a, T: HttpTransport, A: AnisetteProvider> EscrowClient<'a, T, A> {
                 .is_some_and(|value| value.as_signed_integer().unwrap_or(-1) != 0)
         {
             return Err(Error::Authentication(format!(
-                "escrow {command} rejected; no retry was attempted"
+                "escrow {command} rejected{}; no retry was attempted",
+                rejection_message(&value)
+                    .map(|message| format!(": {message}"))
+                    .unwrap_or_default()
             )));
         }
         Ok(value)
@@ -281,6 +288,32 @@ fn rejection_status(value: &plist::Value) -> Option<i64> {
                 .as_signed_integer()
                 .or_else(|| value.as_string().and_then(|text| text.parse().ok()))
         })
+}
+
+/// The server's human-readable rejection reason, which distinguishes a wrong
+/// passcode from a malformed request. It can name account details, so keep it
+/// to one bounded line; response blobs are never included.
+fn rejection_message(value: &plist::Value) -> Option<String> {
+    const LIMIT: usize = 200;
+    let dict = value.as_dictionary()?;
+    let text = ["message", "errorMessage"]
+        .iter()
+        .find_map(|key| dict.get(key).and_then(plist::Value::as_string))?;
+    let mut line: String = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(LIMIT + 1)
+        .collect();
+    if line.is_empty() {
+        return None;
+    }
+    if line.chars().count() > LIMIT {
+        line = line.chars().take(LIMIT).chain(['…']).collect();
+    }
+    Some(line)
 }
 
 fn recover_entropy(
@@ -616,14 +649,14 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn rejection_diagnostics_show_only_numeric_status() {
+    async fn rejection_diagnostics_show_status_and_message_but_never_blobs() {
         struct Reject;
         #[async_trait::async_trait]
         impl HttpTransport for Reject {
             async fn send(&self, _: HttpRequest) -> Result<HttpResponse> {
                 let mut dict = plist::Dictionary::new();
                 dict.insert("status".into(), "-6015".into());
-                dict.insert("message".into(), "private-account-detail-do-not-log".into());
+                dict.insert("message".into(), "Passcode\n  invalid".into());
                 dict.insert("respBlob".into(), "private-response-do-not-log".into());
                 let mut body = Vec::new();
                 plist::Value::Dictionary(dict)
@@ -648,7 +681,24 @@ mod tests {
         .unwrap();
         let message = client.records().await.unwrap_err().to_string();
         assert!(message.contains("409") && message.contains("-6015"));
-        assert!(!message.contains("private-account") && !message.contains("private-response"));
+        assert!(
+            message.contains("status -6015: Passcode invalid)"),
+            "{message}"
+        );
+        assert!(!message.contains("private-response"));
+    }
+    #[test]
+    fn rejection_message_is_one_bounded_line() {
+        let mut dict = plist::Dictionary::new();
+        dict.insert(
+            "errorMessage".into(),
+            format!("a\r\nb\u{7}{}", "x".repeat(500)).into(),
+        );
+        let message = rejection_message(&plist::Value::Dictionary(dict)).unwrap();
+        assert!(message.starts_with("a bx"));
+        assert_eq!(message.chars().count(), 201);
+        assert!(message.ends_with('…'));
+        assert!(rejection_message(&plist::Value::Dictionary(plist::Dictionary::new())).is_none());
     }
     fn session(endpoint: &str) -> SessionState {
         serde_json::from_value(serde_json::json!({
