@@ -1094,11 +1094,15 @@ The body is an XML plist:
   "command": "GETRECORDS" | "SRP_INIT" | "RECOVER",
   "label": escrowRecordLabel,
   "transactionUUID": uppercaseUUID,
-  "userActionLabel": "com.apple.sbd: escrow recovery",
+  "userActionLabel": freeTextReason,
   "version": 1,
   ...command fields...
 }
 ```
+
+`userActionLabel` is free text that Apple records as the reason for the
+request. Describe what this client is doing; do not imitate a first-party
+Apple process name such as `com.apple.sbd`.
 
 The URL slugs are lowercase `get_records`, `srp_init`, and `recover`; their
 body command values are the uppercase forms shown above.
@@ -1142,8 +1146,11 @@ does not establish the cause of any observed live HTTP 409 recovery failure.
 
 For `RECOVER`, copy the initialization header, replace bytes 0:4 with BE32(165)
 and bytes 4:8 with BE32(2 when `clubTypeID == 1`, otherwise 0). Pack the
-identifier into a 20-byte section and `M1` into the next section. Send this as
-the base64 `blob`, with the same label and transaction UUID.
+identifier into a 20-byte section and `M1` into the next section. The 20-byte
+section declares the identifier's true length and is zero-padded after the
+data; declaring 20 bytes produces a message that parses and is rejected. Send
+this as the base64 `blob`, with the same label and transaction UUID, and echo
+the `dsid` string from the `SRP_INIT` reply as a `dsid` body field.
 
 Decode the recovery `respBlob` with header length 40 for club type 1, otherwise
 24, and three sections. Require section 0 to equal `M2`. Header bytes 4:8 give

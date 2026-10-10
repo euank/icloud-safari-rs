@@ -23,6 +23,12 @@ If the account's trusted Apple devices are unavailable, use `cargo run --
 login --sms` to request the code from its trusted phone instead.
 
 Run `cargo run -- status` to inspect local setup without contacting Apple.
+State is kept in `$XDG_STATE_HOME/icloud-safari` (usually
+`~/.local/state/icloud-safari`) on Linux, `~/Library/Application
+Support/dev.icloud-safari.icloud-safari` on macOS, and
+`%LOCALAPPDATA%\icloud-safari\icloud-safari\data` on Windows; pass `--state-dir
+PATH` to choose another location. Earlier builds used `./.icloud-safari` on
+macOS and Windows; move that directory to the new location to keep using it.
 Re-running `login` defaults to the saved account and preserves its encryption
 enrollment and service identifiers. Failed authentication leaves the saved
 session intact. Use a separate `--state-dir PATH` for each Apple Account;

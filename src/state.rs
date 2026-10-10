@@ -59,12 +59,16 @@ impl FileStateStore {
         Ok(StateLock { _file: file })
     }
     pub fn ensure(&self) -> Result<()> {
-        check_directories(&self.root, true)?;
+        check_directories(&self.root, &self.root, true)?;
         set_dir_mode(&self.root)
     }
     pub fn read_json<T: DeserializeOwned>(&self, relative: impl AsRef<Path>) -> Result<T> {
         let path = self.checked_path(relative.as_ref())?;
-        check_directories(path.parent().expect("validated state path"), false)?;
+        check_directories(
+            &self.root,
+            path.parent().expect("validated state path"),
+            false,
+        )?;
         check_file(&path)?;
         let bytes = zeroize::Zeroizing::new(fs::read(path)?);
         Ok(serde_json::from_slice(&bytes)?)
@@ -79,7 +83,7 @@ impl FileStateStore {
         let path = self.checked_path(relative.as_ref())?;
         self.ensure()?;
         let parent = path.parent().expect("validated state path");
-        check_directories(parent, true)?;
+        check_directories(&self.root, parent, true)?;
         // Restrict every directory inside the store, not only the leaf parent.
         let mut directory = self.root.clone();
         for component in relative
@@ -156,19 +160,29 @@ impl Drop for TemporaryFile {
     }
 }
 
-/// Reject symlinks before creating or traversing any directory. These checks
-/// protect against accidental redirection, not concurrent changes by the same
-/// OS user (who can already access this user's credentials).
-fn check_directories(path: &Path, create: bool) -> Result<()> {
+/// Reject symlinks at or below the store root before creating or traversing
+/// any directory. These checks protect against accidental redirection, not
+/// concurrent changes by the same OS user (who can already access this user's
+/// credentials). Ancestors of the root are the user's choice of location and
+/// may be symlinks (e.g. Fedora Atomic `/home -> var/home`, macOS
+/// `/var -> private/var`); they are followed and must resolve to directories.
+fn check_directories(root: &Path, path: &Path, create: bool) -> Result<()> {
+    debug_assert!(path.starts_with(root));
+    let ancestors = root.components().count().saturating_sub(1);
     let mut current = PathBuf::new();
-    for component in path.components() {
+    for (index, component) in path.components().enumerate() {
         if matches!(component, Component::ParentDir) {
             return Err(Error::Fixture(
                 "state root must not contain parent traversal".into(),
             ));
         }
         current.push(component);
-        match fs::symlink_metadata(&current) {
+        let metadata = if index < ancestors {
+            fs::metadata(&current)
+        } else {
+            fs::symlink_metadata(&current)
+        };
+        match metadata {
             Ok(metadata) => {
                 if !metadata.is_dir() || metadata.file_type().is_symlink() {
                     return Err(Error::UnsafePermissions(current));
@@ -362,12 +376,10 @@ mod tests {
         fs::write(outside.join("value.json"), b"42").unwrap();
         let root_link = temp.path().join("root-link");
         symlink(&outside, &root_link).unwrap();
-        for root in [root_link.clone(), root_link.join("child")] {
-            let store = FileStateStore::new(root);
-            assert!(store.ensure().is_err());
-            assert!(store.write_bytes("value.json", b"43").is_err());
-            assert!(store.read_json::<u32>("value.json").is_err());
-        }
+        let store = FileStateStore::new(&root_link);
+        assert!(store.ensure().is_err());
+        assert!(store.write_bytes("value.json", b"43").is_err());
+        assert!(store.read_json::<u32>("value.json").is_err());
         let store = FileStateStore::new(temp.path().join("state"));
         store.ensure().unwrap();
         symlink(&outside, store.root().join("nested")).unwrap();
@@ -382,6 +394,34 @@ mod tests {
             0o755
         );
         assert!(!outside.join("child").exists());
+    }
+
+    #[test]
+    fn follows_symlinked_ancestors_of_the_root() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let temp = tempfile::tempdir().unwrap();
+        let real_home = temp.path().join("var-home");
+        fs::create_dir(&real_home).unwrap();
+        fs::set_permissions(&real_home, fs::Permissions::from_mode(0o755)).unwrap();
+        let home = temp.path().join("home");
+        symlink(&real_home, &home).unwrap();
+        let store = FileStateStore::new(home.join(".local/state/icloud-safari"));
+        let _lock = store.try_lock().unwrap();
+        store.write_json("nested/value.json", &42u32).unwrap();
+        assert_eq!(store.read_json::<u32>("nested/value.json").unwrap(), 42);
+        assert!(
+            real_home
+                .join(".local/state/icloud-safari/nested/value.json")
+                .is_file()
+        );
+        // Only directories at or below the root are restricted.
+        assert_eq!(
+            fs::metadata(&real_home).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        // A symlink inside the root is still refused.
+        symlink(&real_home, store.root().join("link")).unwrap();
+        assert!(store.write_bytes("link/value.json", b"43").is_err());
     }
 
     #[test]

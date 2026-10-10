@@ -307,7 +307,10 @@ async fn run(cli: Cli) -> Result<()> {
             "--fixture-dir is only valid for offline Safari reads, verification and write-plan preparation; remove it to explicitly use a live command",
         ));
     }
-    let state_root = cli.state_dir.unwrap_or_else(default_state_dir);
+    let state_root = match cli.state_dir {
+        Some(path) => path,
+        None => default_state_dir()?,
+    };
     let store = FileStateStore::new(&state_root);
     let writes_state = match &cli.command {
         Command::Status | Command::VerifyFixtures => false,
@@ -676,10 +679,15 @@ fn reader<'a>(fixture: &'a Option<PathBuf>, state: &'a Path) -> Result<OfflineRe
 fn should_fetch(offline: bool, _force_fetch: bool, fixture: &Option<PathBuf>) -> bool {
     !offline && fixture.is_none()
 }
-fn default_state_dir() -> PathBuf {
+/// `$XDG_STATE_HOME/icloud-safari` on Linux. macOS and Windows have no
+/// separate state location, so use the per-user local data directory there
+/// rather than a path relative to the working directory.
+fn default_state_dir() -> Result<PathBuf> {
     directories::ProjectDirs::from("dev", "icloud-safari", "icloud-safari")
-        .and_then(|p| p.state_dir().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from(".icloud-safari"))
+        .map(|p| p.state_dir().unwrap_or(p.data_local_dir()).to_path_buf())
+        .ok_or(Error::Unsupported(
+            "no home directory found for the default state location; pass --state-dir",
+        ))
 }
 async fn login(
     store: &FileStateStore,
@@ -1478,6 +1486,13 @@ fn prompt_line(prompt: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_state_dir_is_absolute() {
+        // A relative default would scatter tokens and private keys into
+        // whatever directory the command happens to run from.
+        assert!(default_state_dir().unwrap().is_absolute());
+    }
 
     #[test]
     fn failed_export_serialization_preserves_existing_output() {
