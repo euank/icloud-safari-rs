@@ -303,27 +303,33 @@ impl WriteWorkspace {
         Ok(Self { root })
     }
 
+    /// Prepare a new `BookmarkLeaf`. An existing leaf only supplies the wire
+    /// encoding of each field; every value is set explicitly (see
+    /// [`bookmark_leaf_field`]). Leaves with fields outside the known schema
+    /// are not used as templates, and the create is refused if none is left.
     pub fn prepare_bookmark_create(&self, value: NewBookmark<'_>) -> Result<PreparedCreate> {
         if value.title.is_empty() || value.url.is_empty() {
             return Err(Error::Fixture(
                 "bookmark title and URL must not be empty".into(),
             ));
         }
+        let parent = value.parent_id.unwrap_or(TOP_BOOKMARK);
+        let new = NewLeafValues {
+            title: value.title.as_bytes().to_vec(),
+            url: value.url.as_bytes().to_vec(),
+            date_added: keyed_date_now()?,
+            parent: parent.to_owned(),
+            position: encode_position(
+                next_sort_value(&self.read_dataset(Dataset::Bookmarks)?, parent)?,
+                &uuid::Uuid::new_v4().to_string().to_uppercase(),
+            )?,
+            device_identifier: writer_device_identifier(&self.root)?,
+        };
         self.prepare_create(
             Dataset::Bookmarks,
             "BookmarkLeaf",
-            BTreeMap::from([
-                ("Title".into(), value.title.as_bytes().to_vec()),
-                ("URL".into(), value.url.as_bytes().to_vec()),
-                ("DateAdded".into(), keyed_date_now()?),
-            ]),
-            BTreeMap::from([(
-                "ParentFolder".into(),
-                value
-                    .parent_id
-                    .unwrap_or("com.apple.Safari.TopBookmark")
-                    .to_owned(),
-            )]),
+            BOOKMARK_LEAF_REQUIRED,
+            &|name| bookmark_leaf_field(name, &new),
         )
     }
 
@@ -342,15 +348,24 @@ impl WriteWorkspace {
             .ok_or_else(|| {
                 Error::Fixture("no CloudTabDevice is available for the new tab".into())
             })?;
+        let title = keyed_string(value.title)?;
+        let url = keyed_string(value.url)?;
+        let date = ckdp_date_now();
+        // Tabs still copy every other template field, Position included.
+        // Only bookmarks have an explicit schema so far.
         self.prepare_create(
             Dataset::Tabs,
             "CloudTab",
-            BTreeMap::from([
-                ("Title".into(), keyed_string(value.title)?),
-                ("URL".into(), keyed_string(value.url)?),
-                ("DateLastViewed".into(), ckdp_date_now()),
-            ]),
-            BTreeMap::from([("OwningDevice".into(), owner)]),
+            &["Title", "URL", "DateLastViewed", "OwningDevice"],
+            &|name| {
+                Some(match name {
+                    "Title" => NewField::Encrypted(title.clone()),
+                    "URL" => NewField::Encrypted(url.clone()),
+                    "DateLastViewed" => NewField::Encrypted(date.clone()),
+                    "OwningDevice" => NewField::StringOrReference(owner.clone()),
+                    _ => NewField::Keep { value_type: None },
+                })
+            },
         )
     }
 
@@ -505,31 +520,47 @@ impl WriteWorkspace {
         Ok(None)
     }
 
+    /// Build a new record from the first `record_type` record whose fields
+    /// all have a [`NewField`] plan and include `required`. `plan` returns
+    /// `None` for a field it does not know, which disqualifies that template.
     fn prepare_create(
         &self,
         dataset: Dataset,
         record_type: &str,
-        encrypted_replacements: BTreeMap<String, Vec<u8>>,
-        string_replacements: BTreeMap<String, String>,
+        required: &[&str],
+        plan: &dyn Fn(&str) -> Option<NewField>,
     ) -> Result<PreparedCreate> {
         let stored = self.read_dataset(dataset)?;
         let mut objects = Vec::new();
         let mut template = None;
+        let mut candidates = 0;
         let mut zone_tag = None;
         for page in &stored.pages {
             let raw = decode_page(page)?;
             objects.extend(extract_objects(&raw)?);
             zone_tag = zone_tag.or_else(|| zone_protection_tag(&raw).ok());
             if template.is_none() {
-                template = find_record_type(&raw, record_type)?.map(|value| value.1);
+                for (_, record) in find_records_of_type(&raw, record_type)? {
+                    candidates += 1;
+                    let parsed = Message::parse(&record)?;
+                    if template_fits(&parsed, required, plan)? {
+                        template = Some(parsed);
+                        break;
+                    }
+                }
             }
         }
         let template = template.ok_or_else(|| {
-            Error::Fixture(format!(
-                "no {record_type} record is available as a schema template"
-            ))
+            Error::Fixture(if candidates == 0 {
+                format!("no {record_type} record is available as a schema template")
+            } else {
+                format!(
+                    "none of the {candidates} {record_type} records has a recognized field set; \
+                     refusing to create a record from an unknown schema"
+                )
+            })
         })?;
-        let template = Message::parse(&template)?;
+        let mut encrypted_replacements = BTreeMap::new();
         let template_name = identifier_name(
             template
                 .first_bytes(2)
@@ -555,8 +586,6 @@ impl WriteWorkspace {
                 .ok_or(Error::Protobuf("template omitted type"))?,
             &mut output,
         );
-        let mut seen_encrypted = BTreeMap::new();
-        let mut seen_strings = BTreeMap::new();
         for raw_field in template.values(7) {
             let Value::Bytes(raw_field) = raw_field else {
                 continue;
@@ -568,42 +597,48 @@ impl WriteWorkspace {
                     .ok_or(Error::Protobuf("record field omitted identifier"))?,
                 false,
             )?;
-            if dataset == Dataset::Bookmarks && name == "PreviewText" {
-                continue;
-            }
-            if let Some(replacement) = string_replacements.get(&name) {
-                let replacement = replace_string_or_reference_value(
-                    field
+            let value_bytes = field
+                .first_bytes(2)
+                .ok_or(Error::Protobuf("record field omitted value"))?
+                .to_vec();
+            let action = plan(&name).ok_or(Error::Integrity)?;
+            let replaced_value = match &action {
+                NewField::Omit => continue,
+                NewField::StringOrReference(replacement) => Some(
+                    replace_string_or_reference_value(&value_bytes, replacement)?,
+                ),
+                NewField::Plain { value, .. } => Some(value.clone()),
+                NewField::FreshIdentityHash if !is_encrypted_value(&value_bytes)? => {
+                    let value = Message::parse(&value_bytes)?;
+                    let old = value
                         .first_bytes(2)
-                        .ok_or(Error::Protobuf("record field omitted value"))?,
-                    replacement,
-                )?;
+                        .ok_or(Error::Protobuf("bytes field omitted value"))?;
+                    Some(ck_value_bytes(&fresh_identity_hash(old)))
+                }
+                _ => None,
+            };
+            if let Some(replacement) = replaced_value {
                 if !field.replace_first_bytes(2, &replacement) {
                     return Err(Error::Protobuf("record field omitted value"));
                 }
-                seen_strings.insert(name.clone(), ());
                 wire::encode_bytes(7, &field.encode(), &mut output);
                 continue;
             }
-            let value = Message::parse(
-                field
-                    .first_bytes(2)
-                    .ok_or(Error::Protobuf("record field omitted value"))?,
-            )?;
-            if value.first_varint(13) == Some(1) && value.first_bytes(2).is_some() {
+            let value = Message::parse(&value_bytes)?;
+            if is_encrypted_value(&value_bytes)? {
                 let old_blob = value
                     .first_bytes(2)
                     .ok_or(Error::Protobuf("encrypted field omitted bytes"))?;
                 let (old_plaintext, mode) = graph
                     .decrypt_field_with_mode(&stored.zone, &template_name, &name, old_blob)?
                     .ok_or(Error::Integrity)?;
-                let plaintext = if let Some(replacement) = encrypted_replacements.get(&name) {
-                    seen_encrypted.insert(name.clone(), ());
-                    replacement.clone()
-                } else if dataset == Dataset::Bookmarks && name == "IdentityHash" {
-                    fresh_identity_hash(&old_plaintext)
-                } else {
-                    old_plaintext
+                let plaintext = match action {
+                    NewField::Encrypted(replacement) => {
+                        encrypted_replacements.insert(name.clone(), replacement.clone());
+                        replacement
+                    }
+                    NewField::FreshIdentityHash => fresh_identity_hash(&old_plaintext),
+                    _ => old_plaintext,
                 };
                 let aad = match mode {
                     FieldAadMode::Legacy => name.clone(),
@@ -625,22 +660,6 @@ impl WriteWorkspace {
                 }
             }
             wire::encode_bytes(7, &field.encode(), &mut output);
-        }
-        let missing: Vec<_> = encrypted_replacements
-            .keys()
-            .filter(|key| !seen_encrypted.contains_key(*key))
-            .chain(
-                string_replacements
-                    .keys()
-                    .filter(|key| !seen_strings.contains_key(*key)),
-            )
-            .cloned()
-            .collect();
-        if !missing.is_empty() {
-            return Err(Error::Fixture(format!(
-                "schema template omitted creation fields: {}",
-                missing.join(", ")
-            )));
         }
         let mut protection_info = Vec::new();
         wire::encode_bytes(1, &protection.der, &mut protection_info);
@@ -749,7 +768,15 @@ fn decode_page(page: &StoredPage) -> Result<Vec<u8>> {
 }
 
 fn find_record_type(response: &[u8], wanted_type: &str) -> Result<Option<(String, Vec<u8>)>> {
+    Ok(find_records_of_type(response, wanted_type)?
+        .into_iter()
+        .next())
+}
+
+/// Every `(record name, record bytes)` of one record type, in response order.
+fn find_records_of_type(response: &[u8], wanted_type: &str) -> Result<Vec<(String, Vec<u8>)>> {
     let response = Message::parse(response)?;
+    let mut found = Vec::new();
     for change in response.values(1) {
         let Value::Bytes(change) = change else {
             continue;
@@ -769,10 +796,332 @@ fn find_record_type(response: &[u8], wanted_type: &str) -> Result<Option<(String
                     .ok_or(Error::Protobuf("record omitted identifier"))?,
                 true,
             )?;
-            return Ok(Some((name, record.to_vec())));
+            found.push((name, record.to_vec()));
         }
     }
-    Ok(None)
+    Ok(found)
+}
+
+/// How one field of a new record is produced from the template's field.
+#[derive(Clone, Debug)]
+enum NewField {
+    /// Encrypt this plaintext under the new record's key. The template's field
+    /// must be encrypted.
+    Encrypted(Vec<u8>),
+    /// Point a string or reference value at this record name.
+    StringOrReference(String),
+    /// Replace the whole CloudKit value with `value`. The template's field must
+    /// have the same CloudKit value type.
+    Plain { value_type: u64, value: Vec<u8> },
+    /// Randomize all but the trailing four bytes of the template's value.
+    FreshIdentityHash,
+    /// Copy the template's value. `Some(type)` requires that value type.
+    Keep { value_type: Option<u64> },
+    /// Leave the field out of the new record.
+    Omit,
+}
+
+/// CloudKit `RecordFieldValue` types observed in Safari records.
+const CK_BYTES: u64 = 1;
+const CK_STRING: u64 = 3;
+const CK_REFERENCE: u64 = 5;
+const CK_INT64: u64 = 7;
+
+const TOP_BOOKMARK: &str = "com.apple.Safari.TopBookmark";
+
+/// Fields a `BookmarkLeaf` template must have. Safari groups fields that
+/// change together and stamps each group with `<Group>_deviceIdentifier` (the
+/// last writer) and `<Group>_generation` (a per-group change counter).
+const BOOKMARK_LEAF_GROUPS: &[&str] = &[
+    "DateAdded",
+    "MinimumAPIVersion",
+    "ParentAndPosition",
+    "TitleURLAndIdentityHash",
+];
+const BOOKMARK_LEAF_REQUIRED: &[&str] = &[
+    "Title",
+    "URL",
+    "DateAdded",
+    "ParentFolder",
+    "IdentityHash",
+    "Position",
+    "MinimumAPIVersion",
+    "DateAdded_deviceIdentifier",
+    "DateAdded_generation",
+    "MinimumAPIVersion_deviceIdentifier",
+    "MinimumAPIVersion_generation",
+    "ParentAndPosition_deviceIdentifier",
+    "ParentAndPosition_generation",
+    "TitleURLAndIdentityHash_deviceIdentifier",
+    "TitleURLAndIdentityHash_generation",
+];
+/// Optional preview fields. They describe the template's page, so a new
+/// bookmark leaves out the text and its group stamps together.
+const BOOKMARK_LEAF_OMITTED: &[&str] = &[
+    "PreviewText",
+    "PreviewTextAndHasUserDefinedPreviewText_deviceIdentifier",
+    "PreviewTextAndHasUserDefinedPreviewText_generation",
+];
+
+struct NewLeafValues {
+    title: Vec<u8>,
+    url: Vec<u8>,
+    date_added: Vec<u8>,
+    parent: String,
+    position: Vec<u8>,
+    device_identifier: String,
+}
+
+/// The value of each known `BookmarkLeaf` field in a new bookmark; `None` for
+/// any other field, so a template carrying one (a Reading List item, say, or
+/// a newer schema) is never cloned.
+fn bookmark_leaf_field(name: &str, new: &NewLeafValues) -> Option<NewField> {
+    if BOOKMARK_LEAF_OMITTED.contains(&name) {
+        return Some(NewField::Omit);
+    }
+    let group_stamp = |suffix: &str| {
+        name.strip_suffix(suffix)
+            .is_some_and(|group| BOOKMARK_LEAF_GROUPS.contains(&group))
+    };
+    Some(match name {
+        "Title" => NewField::Encrypted(new.title.clone()),
+        "URL" => NewField::Encrypted(new.url.clone()),
+        "DateAdded" => NewField::Encrypted(new.date_added.clone()),
+        "ParentFolder" => NewField::StringOrReference(new.parent.clone()),
+        "IdentityHash" => NewField::FreshIdentityHash,
+        "Position" => NewField::Plain {
+            value_type: CK_BYTES,
+            value: ck_value_bytes(&new.position),
+        },
+        "MinimumAPIVersion" => NewField::Keep {
+            value_type: Some(CK_INT64),
+        },
+        _ if group_stamp("_deviceIdentifier") => NewField::Plain {
+            value_type: CK_STRING,
+            value: ck_value_string(&new.device_identifier),
+        },
+        _ if group_stamp("_generation") => NewField::Plain {
+            value_type: CK_INT64,
+            value: ck_value_int(1),
+        },
+        _ => return None,
+    })
+}
+
+/// Whether `record` can serve as the template for `plan`: every field has a
+/// plan whose value-type expectation it meets, no field repeats, and all
+/// `required` fields are present.
+fn template_fits(
+    record: &Message,
+    required: &[&str],
+    plan: &dyn Fn(&str) -> Option<NewField>,
+) -> Result<bool> {
+    let mut seen = std::collections::BTreeSet::new();
+    for raw_field in record.values(7) {
+        let Value::Bytes(raw_field) = raw_field else {
+            continue;
+        };
+        let field = Message::parse(raw_field)?;
+        let name = identifier_name(
+            field
+                .first_bytes(1)
+                .ok_or(Error::Protobuf("record field omitted identifier"))?,
+            false,
+        )?;
+        let Some(value_bytes) = field.first_bytes(2) else {
+            return Ok(false);
+        };
+        let value = Message::parse(value_bytes)?;
+        let value_type = value.first_varint(1);
+        let encrypted = is_encrypted_value(value_bytes)?;
+        let fits = match plan(&name) {
+            None => false,
+            Some(NewField::Omit) => true,
+            Some(NewField::Encrypted(_)) => encrypted,
+            Some(NewField::StringOrReference(_)) => {
+                matches!(value_type, Some(CK_STRING | CK_REFERENCE))
+            }
+            Some(NewField::Plain { value_type: t, .. }) => !encrypted && value_type == Some(t),
+            Some(NewField::FreshIdentityHash) => {
+                encrypted
+                    || (value_type == Some(CK_BYTES)
+                        && value.first_bytes(2).is_some_and(|v| v.len() > 4))
+            }
+            Some(NewField::Keep { value_type: t }) => {
+                t.is_none_or(|t| !encrypted && value_type == Some(t))
+            }
+        };
+        if !fits || !seen.insert(name) {
+            return Ok(false);
+        }
+    }
+    Ok(required.iter().all(|name| seen.contains(*name)))
+}
+
+fn is_encrypted_value(value: &[u8]) -> Result<bool> {
+    let value = Message::parse(value)?;
+    Ok(value.first_varint(13) == Some(1) && value.first_bytes(2).is_some())
+}
+
+/// The sort value for a bookmark appended to `parent`: 1000 past the largest
+/// sort value among its current children (1000 if it has none). Safari's own
+/// appends were observed 1000 apart. A child `Position` that cannot be read
+/// refuses the create instead of guessing an order.
+fn next_sort_value(stored: &StoredDataset, parent: &str) -> Result<i64> {
+    let mut largest: Option<i64> = None;
+    for page in &stored.pages {
+        let raw = decode_page(page)?;
+        for record_type in ["BookmarkLeaf", "BookmarkList"] {
+            for (_, record) in find_records_of_type(&raw, record_type)? {
+                let record = Message::parse(&record)?;
+                let fields = plain_fields(&record)?;
+                if fields
+                    .get("ParentFolder")
+                    .map(|v| parent_name(v))
+                    .transpose()?
+                    .as_deref()
+                    != Some(parent)
+                {
+                    continue;
+                }
+                let Some(position) = fields.get("Position") else {
+                    continue;
+                };
+                let position = Message::parse(position)?;
+                let bytes = position
+                    .first_bytes(2)
+                    .ok_or(Error::Unsupported("bookmark Position is not plain bytes"))?;
+                for value in sort_values(bytes)? {
+                    largest = Some(largest.map_or(value, |l| l.max(value)));
+                }
+            }
+        }
+    }
+    largest
+        .unwrap_or(0)
+        .checked_add(1000)
+        .ok_or(Error::Unsupported("bookmark sort value overflow"))
+}
+
+/// Unencrypted field values of a record, by field name.
+fn plain_fields(record: &Message) -> Result<BTreeMap<String, Vec<u8>>> {
+    let mut fields = BTreeMap::new();
+    for raw_field in record.values(7) {
+        let Value::Bytes(raw_field) = raw_field else {
+            continue;
+        };
+        let field = Message::parse(raw_field)?;
+        let (Some(identifier), Some(value)) = (field.first_bytes(1), field.first_bytes(2)) else {
+            continue;
+        };
+        if !is_encrypted_value(value)? {
+            fields.insert(identifier_name(identifier, false)?, value.to_vec());
+        }
+    }
+    Ok(fields)
+}
+
+/// The record name a `ParentFolder` value points at (a reference, or a plain
+/// string in older records).
+fn parent_name(value: &[u8]) -> Result<String> {
+    let value = Message::parse(value)?;
+    match value.first_varint(1) {
+        Some(CK_REFERENCE) => {
+            let reference = Message::parse(
+                value
+                    .first_bytes(9)
+                    .ok_or(Error::Protobuf("reference value omitted reference"))?,
+            )?;
+            identifier_name(
+                reference
+                    .first_bytes(2)
+                    .ok_or(Error::Protobuf("reference omitted record identifier"))?,
+                true,
+            )
+        }
+        _ => std::str::from_utf8(value.first_bytes(7).ok_or(Error::Protobuf(
+            "ParentFolder is neither reference nor string",
+        ))?)
+        .map(str::to_owned)
+        .map_err(|_| Error::Protobuf("ParentFolder string is not UTF-8")),
+    }
+}
+
+/// Safari's `Position` value: zlib-compressed JSON of the form
+/// `{"default":{"sortValues":[{"changeID":0,"sortValue":946,"deviceIdentifier":"…"}]}}`.
+/// Folders at the top level carry `{}`, which has no sort values.
+fn sort_values(position: &[u8]) -> Result<Vec<i64>> {
+    use std::io::Read as _;
+    let mut json = Vec::new();
+    flate2::read::ZlibDecoder::new(position)
+        .read_to_end(&mut json)
+        .map_err(|_| Error::Unsupported("bookmark Position is not zlib data"))?;
+    let json: serde_json::Value = serde_json::from_slice(&json)?;
+    let Some(entries) = json.pointer("/default/sortValues") else {
+        return if json.as_object().is_some_and(|o| o.is_empty()) {
+            Ok(Vec::new())
+        } else {
+            Err(Error::Unsupported("bookmark Position has an unknown shape"))
+        };
+    };
+    entries
+        .as_array()
+        .ok_or(Error::Unsupported("bookmark sortValues is not an array"))?
+        .iter()
+        .map(|entry| {
+            let value = entry
+                .get("sortValue")
+                .and_then(serde_json::Value::as_f64)
+                .ok_or(Error::Unsupported("bookmark sortValue is not a number"))?;
+            if !value.is_finite() || value.abs() > 1e15 {
+                return Err(Error::Unsupported("bookmark sortValue is out of range"));
+            }
+            Ok(value.ceil() as i64)
+        })
+        .collect()
+}
+
+/// Encode a `Position` with one sort value, in the same shape Safari uses.
+/// The sort entry's `deviceIdentifier` differs per bookmark in Safari's own
+/// records (and from the record's group stamps), so each entry gets a new one.
+fn encode_position(sort_value: i64, entry_identifier: &str) -> Result<Vec<u8>> {
+    use std::io::Write as _;
+    // Written by hand to keep Safari's key order (serde_json sorts keys).
+    let json = format!(
+        r#"{{"default":{{"sortValues":[{{"changeID":0,"sortValue":{sort_value},"deviceIdentifier":{}}}]}}}}"#,
+        serde_json::to_string(entry_identifier)?
+    );
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder.write_all(json.as_bytes())?;
+    Ok(encoder.finish()?)
+}
+
+#[derive(Serialize, Deserialize)]
+struct WriterDevice {
+    device_identifier: String,
+}
+
+const WRITER_DEVICE_FILE: &str = "safari-writer-device.json";
+
+/// This writer's identifier for Safari's per-group `_deviceIdentifier`
+/// stamps: created once per state directory and reused, so the bridge shows
+/// up as one consistent device instead of borrowing another device's id.
+fn writer_device_identifier(root: &Path) -> Result<String> {
+    let store = crate::state::FileStateStore::new(root);
+    if root.join(WRITER_DEVICE_FILE).exists() {
+        let device: WriterDevice = store.read_json(WRITER_DEVICE_FILE)?;
+        if uuid::Uuid::parse_str(&device.device_identifier).is_err() {
+            return Err(Error::Fixture(format!(
+                "{WRITER_DEVICE_FILE} does not hold a UUID"
+            )));
+        }
+        return Ok(device.device_identifier);
+    }
+    let device = WriterDevice {
+        device_identifier: uuid::Uuid::new_v4().to_string().to_uppercase(),
+    };
+    store.write_json(WRITER_DEVICE_FILE, &device)?;
+    Ok(device.device_identifier)
 }
 
 pub(crate) fn zone_protection_tag(response: &[u8]) -> Result<String> {
@@ -817,8 +1166,22 @@ fn rename_record_identifier(raw: &[u8], name: &str) -> Result<Vec<u8>> {
 
 fn ck_value_string(value: &str) -> Vec<u8> {
     let mut output = Vec::new();
-    wire::encode_uint(1, 3, &mut output);
+    wire::encode_uint(1, CK_STRING, &mut output);
     wire::encode_string(7, value, &mut output);
+    output
+}
+
+fn ck_value_bytes(value: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+    wire::encode_uint(1, CK_BYTES, &mut output);
+    wire::encode_bytes(2, value, &mut output);
+    output
+}
+
+fn ck_value_int(value: u64) -> Vec<u8> {
+    let mut output = Vec::new();
+    wire::encode_uint(1, CK_INT64, &mut output);
+    wire::encode_uint(4, value, &mut output);
     output
 }
 
@@ -1152,5 +1515,256 @@ mod tests {
         let encoded = encode_ckdp_string("Safari");
         let parsed = Message::parse(&encoded).unwrap();
         assert_eq!(parsed.first_bytes(6), Some(b"Safari".as_slice()));
+    }
+
+    fn name_message(name: &str) -> Vec<u8> {
+        let mut output = Vec::new();
+        wire::encode_string(1, name, &mut output);
+        output
+    }
+
+    fn record_identifier(name: &str) -> Vec<u8> {
+        let mut output = Vec::new();
+        wire::encode_bytes(1, &name_message(name), &mut output);
+        output
+    }
+
+    fn reference(parent: &str) -> Vec<u8> {
+        let mut reference = Vec::new();
+        wire::encode_uint(1, 2, &mut reference);
+        wire::encode_bytes(2, &record_identifier(parent), &mut reference);
+        let mut value = Vec::new();
+        wire::encode_uint(1, CK_REFERENCE, &mut value);
+        wire::encode_bytes(9, &reference, &mut value);
+        value
+    }
+
+    fn encrypted(blob: &[u8]) -> Vec<u8> {
+        let mut value = Vec::new();
+        wire::encode_uint(1, 20, &mut value);
+        wire::encode_bytes(2, blob, &mut value);
+        wire::encode_uint(13, 1, &mut value);
+        value
+    }
+
+    fn record(record_type: &str, name: &str, fields: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut output = Vec::new();
+        wire::encode_bytes(2, &record_identifier(name), &mut output);
+        wire::encode_bytes(3, &name_message(record_type), &mut output);
+        for (field_name, value) in fields {
+            let mut field = Vec::new();
+            wire::encode_bytes(1, &name_message(field_name), &mut field);
+            wire::encode_bytes(2, value, &mut field);
+            wire::encode_bytes(7, &field, &mut output);
+        }
+        output
+    }
+
+    /// A leaf shaped like the ones Safari wrote in the captured fixtures.
+    fn safari_leaf(name: &str, parent: &str, sort_value: i64) -> Vec<(&'static str, Vec<u8>)> {
+        let mut fields = vec![
+            ("Title", encrypted(b"t")),
+            ("URL", encrypted(b"u")),
+            ("DateAdded", encrypted(b"d")),
+            ("ParentFolder", reference(parent)),
+            ("IdentityHash", ck_value_bytes(&[7; 36])),
+            (
+                "Position",
+                ck_value_bytes(&encode_position(sort_value, name).unwrap()),
+            ),
+            ("MinimumAPIVersion", ck_value_int(1)),
+        ];
+        for group in BOOKMARK_LEAF_GROUPS {
+            let stamp: &'static str = Box::leak(format!("{group}_deviceIdentifier").into());
+            let generation: &'static str = Box::leak(format!("{group}_generation").into());
+            fields.push((
+                stamp,
+                ck_value_string("48C0AB8B-8BEE-4BE1-AD9E-7AF43E40EB55"),
+            ));
+            fields.push((generation, ck_value_int(3)));
+        }
+        fields
+    }
+
+    fn leaf_values() -> NewLeafValues {
+        NewLeafValues {
+            title: b"T".to_vec(),
+            url: b"https://example.invalid/".to_vec(),
+            date_added: b"D".to_vec(),
+            parent: "Folder".into(),
+            position: encode_position(2000, "E").unwrap(),
+            device_identifier: "WRITER".into(),
+        }
+    }
+
+    fn fits(fields: &[(&str, Vec<u8>)]) -> bool {
+        let values = leaf_values();
+        let parsed = Message::parse(&record("BookmarkLeaf", "R", fields)).unwrap();
+        template_fits(&parsed, BOOKMARK_LEAF_REQUIRED, &|name| {
+            bookmark_leaf_field(name, &values)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn safari_shaped_leaf_is_an_acceptable_template() {
+        let mut fields = safari_leaf("A", "Folder", 1000);
+        assert!(fits(&fields));
+        fields.push(("PreviewText", encrypted(b"p")));
+        fields.push((
+            "PreviewTextAndHasUserDefinedPreviewText_deviceIdentifier",
+            ck_value_string("X"),
+        ));
+        fields.push((
+            "PreviewTextAndHasUserDefinedPreviewText_generation",
+            ck_value_int(1),
+        ));
+        assert!(fits(&fields));
+    }
+
+    #[test]
+    fn leaf_with_unknown_missing_or_mistyped_fields_is_not_a_template() {
+        let base = safari_leaf("A", "Folder", 1000);
+
+        let mut unknown = base.clone();
+        unknown.push(("ReadingListDateLastViewed", encrypted(b"x")));
+        assert!(!fits(&unknown), "unknown field");
+
+        let mut unknown_group = base.clone();
+        unknown_group.push(("SomethingNew_generation", ck_value_int(1)));
+        assert!(!fits(&unknown_group), "stamp for an unknown group");
+
+        let missing: Vec<_> = base
+            .iter()
+            .filter(|(name, _)| *name != "Position")
+            .cloned()
+            .collect();
+        assert!(!fits(&missing), "missing Position");
+
+        let mut mistyped = base.clone();
+        for field in &mut mistyped {
+            if field.0 == "Position" {
+                field.1 = encrypted(b"p");
+            }
+        }
+        assert!(!fits(&mistyped), "encrypted Position");
+
+        let mut plain_title = base.clone();
+        for field in &mut plain_title {
+            if field.0 == "Title" {
+                field.1 = ck_value_string("t");
+            }
+        }
+        assert!(!fits(&plain_title), "unencrypted Title");
+
+        let mut duplicate = base.clone();
+        duplicate.push(("Position", ck_value_bytes(b"x")));
+        assert!(!fits(&duplicate), "repeated field");
+    }
+
+    #[test]
+    fn leaf_field_plan_sets_every_value_explicitly() {
+        let values = leaf_values();
+        let plan = |name| bookmark_leaf_field(name, &values);
+        assert!(matches!(plan("PreviewText"), Some(NewField::Omit)));
+        assert!(matches!(
+            plan("IdentityHash"),
+            Some(NewField::FreshIdentityHash)
+        ));
+        assert!(matches!(
+            plan("MinimumAPIVersion"),
+            Some(NewField::Keep {
+                value_type: Some(CK_INT64)
+            })
+        ));
+        let Some(NewField::Plain { value, .. }) = plan("ParentAndPosition_deviceIdentifier") else {
+            panic!("device stamp is not replaced");
+        };
+        assert_eq!(value, ck_value_string("WRITER"));
+        let Some(NewField::Plain { value, .. }) = plan("TitleURLAndIdentityHash_generation") else {
+            panic!("generation is not replaced");
+        };
+        assert_eq!(value, ck_value_int(1));
+        let Some(NewField::Plain { value, .. }) = plan("Position") else {
+            panic!("Position is not replaced");
+        };
+        assert_eq!(value, ck_value_bytes(&values.position));
+        assert!(plan("Unknown").is_none());
+    }
+
+    #[test]
+    fn position_round_trips_in_safaris_shape() {
+        let encoded = encode_position(2946, "ENTRY").unwrap();
+        assert_eq!(&encoded[..2], &[0x78, 0xda]);
+        let mut json = String::new();
+        std::io::Read::read_to_string(
+            &mut flate2::read::ZlibDecoder::new(encoded.as_slice()),
+            &mut json,
+        )
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"default":{"sortValues":[{"changeID":0,"sortValue":2946,"deviceIdentifier":"ENTRY"}]}}"#
+        );
+        assert_eq!(sort_values(&encoded).unwrap(), vec![2946]);
+    }
+
+    #[test]
+    fn empty_position_has_no_sort_values_and_garbage_is_refused() {
+        let mut empty = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        std::io::Write::write_all(&mut empty, b"{}").unwrap();
+        assert!(sort_values(&empty.finish().unwrap()).unwrap().is_empty());
+        assert!(sort_values(b"not zlib").is_err());
+        let mut odd = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        std::io::Write::write_all(&mut odd, br#"{"other":1}"#).unwrap();
+        assert!(sort_values(&odd.finish().unwrap()).is_err());
+    }
+
+    fn dataset(records: &[Vec<u8>]) -> StoredDataset {
+        let mut response = Vec::new();
+        for record in records {
+            let mut change = Vec::new();
+            wire::encode_bytes(5, record, &mut change);
+            wire::encode_bytes(1, &change, &mut response);
+        }
+        StoredDataset {
+            zone: "Bookmarks".into(),
+            pages: vec![StoredPage {
+                raw_response_base64: STANDARD.encode(response),
+            }],
+        }
+    }
+
+    #[test]
+    fn next_sort_value_appends_after_the_parents_last_child() {
+        let stored = dataset(&[
+            record("BookmarkLeaf", "A", &safari_leaf("A", "Folder", 946)),
+            record("BookmarkLeaf", "B", &safari_leaf("B", "Folder", 1946)),
+            record("BookmarkLeaf", "C", &safari_leaf("C", "Other", 90_000)),
+        ]);
+        assert_eq!(next_sort_value(&stored, "Folder").unwrap(), 2946);
+        assert_eq!(next_sort_value(&stored, "Other").unwrap(), 91_000);
+        assert_eq!(next_sort_value(&stored, "Empty").unwrap(), 1000);
+    }
+
+    #[test]
+    fn next_sort_value_refuses_an_unreadable_sibling_position() {
+        let mut broken = safari_leaf("A", "Folder", 946);
+        for field in &mut broken {
+            if field.0 == "Position" {
+                field.1 = ck_value_bytes(b"garbage");
+            }
+        }
+        let stored = dataset(&[record("BookmarkLeaf", "A", &broken)]);
+        assert!(next_sort_value(&stored, "Folder").is_err());
+        assert_eq!(next_sort_value(&stored, "Elsewhere").unwrap(), 1000);
+    }
+
+    #[test]
+    fn writer_device_identifier_is_created_once_and_reused() {
+        let root = tempfile::tempdir().unwrap();
+        let first = writer_device_identifier(root.path()).unwrap();
+        assert!(uuid::Uuid::parse_str(&first).is_ok());
+        assert_eq!(writer_device_identifier(root.path()).unwrap(), first);
     }
 }

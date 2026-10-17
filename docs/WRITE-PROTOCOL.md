@@ -46,8 +46,32 @@ The Rust library exposes `WriteWorkspace`; the CLI exposes `write create`,
 - RFC-6637-wraps it to the recovered zone child identity;
 - DER-encodes encrypted PCS identities, self-signature, outer zone-child
   signature, HMAC, key hint, and SHA-1 protection tag;
-- re-encrypts a current record-type template under the new key while replacing
-  title, URL, date, parent/owner, and uniqueness fields;
+- takes the wire encoding of each field from an existing record of the same
+  type (the template), never a value it has not decided on. For
+  `BookmarkLeaf` every field has an explicit rule:
+  - `Title`, `URL`, `DateAdded`: the new values, encrypted under the new key;
+  - `ParentFolder`: a reference to the target folder;
+  - `IdentityHash`: a random body plus the template's four-byte suffix (the
+    suffix is identical across all observed records);
+  - `Position`: zlib-compressed `{"default":{"sortValues":[{"changeID":0,
+    "sortValue":N,"deviceIdentifier":ID}]}}`, with `N` 1000 past the largest
+    sort value in the target folder (Safari's own appends were observed 1000
+    apart) and a fresh `ID` (Safari's records each carry a distinct one);
+  - `<Group>_deviceIdentifier` for the groups `DateAdded`,
+    `MinimumAPIVersion`, `ParentAndPosition` and `TitleURLAndIdentityHash`:
+    this writer's identifier, created once and kept in
+    `safari-writer-device.json` in the state directory;
+  - `<Group>_generation`: 1;
+  - `MinimumAPIVersion`: copied from the template (an integer);
+  - `PreviewText` and its `PreviewTextAndHasUserDefinedPreviewText_*` stamps:
+    left out.
+
+  A leaf with any other field (a Reading List item, or a newer schema), a
+  missing field, or a field of an unexpected type is not used as a template.
+  If no leaf qualifies, or a sibling's `Position` cannot be read, the create
+  is refused. These rules are inferred from captured records and not yet
+  checked against Safari on an Apple device. `CloudTab` creation still copies
+  every field it does not replace, `Position` included;
 - reopens the generated object through a fresh ordinary PCS key graph before
   allowing a request to be sent;
 - saves with merge and fail-if-exists semantics plus the freshly fetched zone
